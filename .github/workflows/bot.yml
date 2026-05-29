@@ -1,0 +1,17 @@
+name: JazzDrive Bot v6
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Bot
+        run: bash start.sh
