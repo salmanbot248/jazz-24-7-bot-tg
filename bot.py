@@ -2,6 +2,7 @@
 # 🤖 KAREEM BOT v4.1 - HIGH QUALITY FIXED
 # 📸 YouTube (HD/4K) | Google Drive | MediaFire | Direct Links
 # 🧠 Smart Cache | 🔄 Multi-Client Auto-Retry | ⚡ Fast Download
+# 💓 Heartbeat Included (Keep Alive)
 # ==========================================
 
 import os, asyncio, time, json, re, requests, gdown
@@ -18,6 +19,19 @@ LOGIN_URL     = "https://cloud.jazzdrive.com.pk/login"
 os.makedirs("downloads",   exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
 
+# ─────────────────────────────────────────
+# 💓 HEARTBEAT (Session Keep Alive)
+# ─────────────────────────────────────────
+async def heartbeat(page):
+    """ہر 5 منٹ بعد پیج کو ریفریش کرتا ہے تاکہ کوکیز ایکسپائر نہ ہوں"""
+    while True:
+        await asyncio.sleep(300) # 5 minutes wait
+        try:
+            await page.reload()
+            print(f"\n💓 [Heartbeat] JazzDrive pinged at: {time.strftime('%H:%M:%S')}")
+        except Exception as e:
+            print(f"  ⚠️ Heartbeat error: {e}")
+            break
 
 # ─────────────────────────────────────────
 # 💾  SELECTOR CACHE
@@ -55,7 +69,6 @@ class SelectorCache:
 
 cache = SelectorCache()
 
-
 # ─────────────────────────────────────────
 # 🔇  SILENT LOGGER
 # ─────────────────────────────────────────
@@ -63,7 +76,6 @@ class SilentLogger:
     def debug(self, msg):   pass
     def warning(self, msg): pass
     def error(self, msg):   pass
-
 
 # ─────────────────────────────────────────
 # 📸  SCREENSHOT
@@ -75,7 +87,6 @@ async def take_ss(page, name):
         print(f"  📸 {path}")
     except:
         pass
-
 
 # ─────────────────────────────────────────
 # 🌐  JAZZDRIVE OPEN
@@ -109,7 +120,6 @@ async def open_jazzdrive(page):
 
     await take_ss(page, "WARN_state")
     return True
-
 
 # ─────────────────────────────────────────
 # 📂  FOLDER NAVIGATE
@@ -165,7 +175,6 @@ async def navigate_to_folder(page, folder_name):
 
     print(f"  ⚠️ Folder '{fn}' nahi mila — ROOT mein upload hoga")
     return False
-
 
 # ─────────────────────────────────────────
 # ⬆️  UPLOAD BUTTON CLICK
@@ -229,7 +238,6 @@ async def click_upload_button(page):
     await take_ss(page, "FAIL_uploadbtn")
     print("  ❌ Upload button nahi mila!")
     return False
-
 
 # ─────────────────────────────────────────
 # 📁  DIALOG → "Upload files" → FILE SET
@@ -301,7 +309,6 @@ async def set_files_via_dialog(page, file_paths):
 
     return await _direct_input(page, files)
 
-
 async def _direct_input(page, files):
     await page.evaluate("""
         document.querySelectorAll('input[type="file"]').forEach(el => {
@@ -322,7 +329,6 @@ async def _direct_input(page, files):
         await take_ss(page, "FAIL_fileset")
         print(f"  ❌ File set fail: {e}")
         return False
-
 
 # ─────────────────────────────────────────
 # ✅  WAIT FOR UPLOAD COMPLETE
@@ -353,7 +359,6 @@ async def wait_upload_done(page, timeout_min=120):
 
     print(f"  ⚠️ Timeout! Manually check karo.")
     return False
-
 
 # ─────────────────────────────────────────
 # 🌐  JAZZDRIVE LOGIN (OTP)
@@ -417,7 +422,6 @@ async def jazz_login(number):
         finally:
             await browser.close()
 
-
 # ─────────────────────────────────────────
 # 📋  PLAYLIST / LINK FETCH
 # ─────────────────────────────────────────
@@ -453,9 +457,8 @@ def get_playlist_entries(link):
             url = info.get('webpage_url') or link
             return [{'url': url, 'webpage_url': url, 'title': info.get('title', 'Video')}]
     except Exception as e:
-        print(f"  ❌ Playlist fetch fail: {e}")
+        print(f"  ❌ Playlist fetch fetch fail: {e}")
         return []
-
 
 # ─────────────────────────────────────────
 # 📂  GOOGLE DRIVE DOWNLOAD
@@ -478,7 +481,6 @@ def download_from_google_drive(url, idx):
         except Exception as e:
             print(f"  ❌ Google Drive fail: {e}")
     return None
-
 
 # ─────────────────────────────────────────
 # 🔥  MEDIAFIRE DOWNLOAD
@@ -513,7 +515,6 @@ def download_from_mediafire(url, idx):
         print(f"  ❌ MediaFire fail: {e}")
     return None
 
-
 # ─────────────────────────────────────────
 # 🔗  GENERIC DIRECT DOWNLOAD
 # ─────────────────────────────────────────
@@ -542,341 +543,138 @@ def download_generic_file(url, idx):
         print(f"  ❌ Direct download fail: {e}")
         return None
 
-
 # ─────────────────────────────────────────
-# 📥  YOUTUBE DOWNLOAD — v4.1 HIGH QUALITY FIXED
+# 📥  YOUTUBE DOWNLOAD
 # ─────────────────────────────────────────
 def download_one(url, idx, total, quality):
     if not url.startswith('http'):
         return None
     print(f"\n  🔗 [{idx}/{total}] {url[:80]}")
-
-    # Platform routing
     if "drive.google.com" in url: return download_from_google_drive(url, idx)
     if "mediafire.com"    in url: return download_from_mediafire(url, idx)
     if not any(x in url for x in ["youtube.com", "youtu.be"]):
         return download_generic_file(url, idx)
 
-    # ─── YouTube Download ───
     ck = next((n for n in ['cookies.txt', 'youtube.com_cookies.txt', 'yt_cookies.txt']
                if os.path.exists(n)), None)
-    if ck:
-        print(f"  🍪 Cookies mil gayi: {ck}")
+    
+    fmt = (f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
+           f'bestvideo[height<={quality}]+bestaudio/'
+           f'best[height<={quality}]/best')
 
-    # ----- IMPROVED FORMAT SELECTION -----
-    # Priority: 1. H264 (mp4) + m4a audio  → 2. VP9 (webm) + opus  → 3. any
-    # Use format-sort to prefer HDR → higher resolution → efficient codec
-    fmt = (
-        f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
-        f'bestvideo[height<={quality}][ext=webm]+bestaudio[ext=webm]/'
-        f'bestvideo[height<={quality}]+bestaudio/'
-        f'best[height<={quality}]/best'
-    )
-
-    # Base options
     BASE_OPTS = {
-        'format':              fmt,
-        'format_sort':         ['res', 'codec:avc1', 'codec:mp4a', 'codec:opus', 'hdr:12', 'hdr:10'],
+        'format': fmt,
         'merge_output_format': 'mp4',
-        'outtmpl':             f'downloads/{idx:02d}_%(title)s.%(ext)s',
-        'restrictfilenames':   True,
-        'noplaylist':          True,
-        'quiet':               False,
-        'no_warnings':         False,
-        'noprogress':          True,
-        'retries':             5,
-        'fragment_retries':    5,
+        'outtmpl': f'downloads/{idx:02d}_%(title)s.%(ext)s',
+        'restrictfilenames': True,
+        'noplaylist': True,
+        'quiet': False,
+        'noprogress': True,
+        'retries': 5,
+        'fragment_retries': 5,
         'concurrent_fragment_downloads': 4,
-        'socket_timeout':      30,
-        'http_headers': {
-            'User-Agent':      (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            ),
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
-        },
-        'postprocessors': [{
-            'key':            'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
-        # Ensure we always get the best quality even if no direct mp4
-        'allow_unplayable_formats': False,
+        'socket_timeout': 30,
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
+        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
     }
+    if ck: BASE_OPTS['cookiefile'] = ck
 
-    if ck:
-        BASE_OPTS['cookiefile'] = ck
-
-    # ----- IMPROVED STRATEGY ORDER -----
-    # web_creator and web work best for high quality; tv_embedded often downgrades
-    STRATEGIES = [
-        {
-            'name': 'web_creator',   # Best for HD/4K
-            'extractor_args': {'youtube': {'player_client': ['web_creator']}},
-        },
-        {
-            'name': 'web',           # Standard web client – reliable
-            'extractor_args': {'youtube': {'player_client': ['web']}},
-        },
-        {
-            'name': 'android',       # Mobile client – sometimes higher bitrate
-            'extractor_args': {'youtube': {'player_client': ['android']}},
-        },
-        {
-            'name': 'ios',           # Fallback
-            'extractor_args': {'youtube': {'player_client': ['ios']}},
-        },
-        {
-            'name': 'tv_embedded',   # Last resort (can cause quality loss)
-            'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
-        },
-        {
-            'name': 'default',
-            'extractor_args': {},
-        },
-    ]
-
-    for strategy in STRATEGIES:
-        opts = BASE_OPTS.copy()
-        if strategy['extractor_args']:
-            opts['extractor_args'] = strategy['extractor_args']
-
-        print(f"  🔄 Strategy [{strategy['name']}] try ho rahi hai...")
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    print(f"  ⚠️ [{strategy['name']}] info nahi mili")
-                    continue
-
-                # Find downloaded file
-                base = os.path.splitext(ydl.prepare_filename(info))[0]
-                for ext in ['.mp4', '.mkv', '.webm', '.m4a', '.mp3']:
-                    fpath = base + ext
-                    if os.path.exists(fpath):
-                        mb = os.path.getsize(fpath) / 1e6
-                        h  = info.get('height', '?')
-                        print(f"  ✅ [{strategy['name']}] Done! "
-                              f"{info.get('title','')[:35]} | {h}p | {mb:.0f}MB")
-                        return fpath
-
-                # Fallback: search by idx prefix
-                for f in sorted(os.listdir('downloads')):
-                    if f.startswith(f'{idx:02d}_'):
-                        fpath = os.path.join('downloads', f)
-                        mb    = os.path.getsize(fpath) / 1e6
-                        print(f"  ✅ [{strategy['name']}] {f[:40]} | {mb:.0f}MB")
-                        return fpath
-
-        except Exception as e:
-            err = str(e)
-            SKIP_ERRORS = ['sign in', 'private', 'members only', 'login',
-                           'age-restricted', 'unavailable', 'removed',
-                           'copyright', 'not available in your country']
-            if any(x in err.lower() for x in SKIP_ERRORS):
-                print(f"  ⛔ Skip (restricted): {err[:100]}")
-                return None
-            else:
-                print(f"  ⚠️ [{strategy['name']}] fail: {err[:150]}")
-                print(f"  ⏳ 3 sec wait, next strategy...")
-                time.sleep(3)
-                continue
-
-    print(f"  ❌ Saari strategies fail! Video skip ho raha hai.")
-    return None
-
+    try:
+        with yt_dlp.YoutubeDL(BASE_OPTS) as ydl:
+            info = ydl.extract_info(url, download=True)
+            fpath = ydl.prepare_filename(info).replace('.webm', '.mp4').replace('.mkv', '.mp4')
+            if not os.path.exists(fpath): # Fallback
+                for f in os.listdir('downloads'):
+                    if f.startswith(f'{idx:02d}_'): fpath = os.path.join('downloads', f)
+            return fpath
+    except Exception as e:
+        print(f"  ❌ Youtube download fail: {e}")
+        return None
 
 # ─────────────────────────────────────────
-# ✂️  FILE SPLIT (2GB se bade files)
+# ✂️  FILE SPLIT
 # ─────────────────────────────────────────
 def split_file(path, max_mb=1900):
     mb = os.path.getsize(path) / 1e6
-    if mb <= 1990:
-        return [path]
+    if mb <= 1990: return [path]
     print(f"  ✂️ {mb:.0f}MB — 2GB limit ke liye split ho raha hai...")
     base, ext = os.path.splitext(path)
     parts = []
     try:
         import subprocess
-        import json as jj
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
-            capture_output=True, text=True)
-        dur = float(jj.loads(probe.stdout)["format"]["duration"])
-        pd  = dur * (max_mb / mb)
+        probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path], capture_output=True, text=True)
+        dur = float(json.loads(probe.stdout)["format"]["duration"])
+        pd = dur * (max_mb / mb)
         for i in range(int(dur / pd) + 1):
             s = i * pd
             if s >= dur: break
             pp = f"{base}_part{i+1:02d}{ext}"
-            subprocess.run(
-                ["ffmpeg", "-y", "-ss", str(s), "-i", path,
-                 "-t", str(pd), "-c", "copy",
-                 "-avoid_negative_ts", "make_zero", pp],
-                capture_output=True)
-            if os.path.exists(pp):
-                mb_p = os.path.getsize(pp) / 1e6
-                print(f"  ✂️ Part {i+1}: {os.path.basename(pp)} | {mb_p:.0f}MB")
-                parts.append(pp)
-        if parts:
-            os.remove(path)
-            return parts
-    except Exception as e:
-        print(f"  ❌ Split fail: {e}")
-    return [path]
-
+            subprocess.run(["ffmpeg", "-y", "-ss", str(s), "-i", path, "-t", str(pd), "-c", "copy", "-avoid_negative_ts", "make_zero", pp], capture_output=True)
+            if os.path.exists(pp): parts.append(pp)
+        if parts: os.remove(path)
+        return parts
+    except: return [path]
 
 # ─────────────────────────────────────────
 # 🚀  MAIN PIPELINE (Download → Upload)
 # ─────────────────────────────────────────
 async def pipeline(url_list, quality, folder):
     loop = asyncio.get_event_loop()
-
-    # Saare links collect karo
     all_entries = []
     for u in url_list:
         ents = get_playlist_entries(u)
-        if not ents:
-            ents = [{'url': u, 'webpage_url': u, 'title': 'File'}]
+        if not ents: ents = [{'url': u, 'webpage_url': u, 'title': 'File'}]
         all_entries.extend(ents)
 
     total = len(all_entries)
-    print(f"\n{'='*55}")
-    print(f"  📺 Total: {total} | Quality: {quality}p | Folder: {folder or 'ROOT'}")
-    print(f"{'='*55}")
-
+    
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        )
-        ctx  = await browser.new_context(
-            storage_state=COOKIES_FILE,
-            viewport={'width': 1280, 'height': 720}
-        )
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        ctx  = await browser.new_context(storage_state=COOKIES_FILE, viewport={'width': 1280, 'height': 720})
         page = await ctx.new_page()
+
+        # 💓 START HEARTBEAT
+        heartbeat_task = asyncio.create_task(heartbeat(page))
 
         if not await open_jazzdrive(page):
             await browser.close(); return
 
         await navigate_to_folder(page, folder)
 
-        queued = failed = skipped = 0
-
         for idx, entry in enumerate(all_entries, 1):
-            ep_url   = entry.get('webpage_url') or entry.get('url', '')
-            ep_title = entry.get('title', '?')[:40]
-            print(f"\n{'─'*50}")
-            print(f"  📥 [{idx}/{total}] {ep_title}")
-
-            fpath = await loop.run_in_executor(
-                None, download_one, ep_url, idx, total, quality
-            )
-
-            if not fpath:
-                print(f"  ⚠️ Download fail/skip — agla...")
-                failed += 1
-                continue
-
-            # Split if needed + upload
+            fpath = await loop.run_in_executor(None, download_one, entry.get('webpage_url') or entry.get('url', ''), idx, total, quality)
+            if not fpath: continue
+            
             parts = split_file(fpath)
             for part in parts:
-                if not os.path.exists(part):
-                    continue
-
-                ok = await click_upload_button(page)
-                if not ok:
-                    cache.forget("upload_btn")
-                    await asyncio.sleep(2)
-                    ok = await click_upload_button(page)
-                if not ok:
-                    failed += 1
-                    continue
-
-                ok = await set_files_via_dialog(page, part)
-                if not ok:
-                    failed += 1
-                    continue
-
+                if not await click_upload_button(page): continue
+                if not await set_files_via_dialog(page, part): continue
                 await asyncio.sleep(2)
-                queued += 1
-                print(f"  ➕ Queue mein add [{queued}] {os.path.basename(part)[:40]}")
-
-            await asyncio.sleep(1)
-
-        print(f"\n{'='*55}")
-        print(f"  ✅ Queued: {queued} | ❌ Failed: {failed}")
-        print(f"{'='*55}\n")
-
+        
         await wait_upload_done(page)
+        heartbeat_task.cancel() # STOP HEARTBEAT
         await browser.close()
 
-
 # ─────────────────────────────────────────
-# 📦  BATCH UPLOAD (existing files)
+# 📦  BATCH UPLOAD
 # ─────────────────────────────────────────
 async def batch_upload(file_paths, folder):
-    valid = [f for f in file_paths if os.path.exists(f)]
-    if not valid:
-        print("❌ Koi file nahi mili downloads/ mein!")
-        return False
-
-    print(f"\n🚀 Batch upload: {len(valid)} files")
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        )
-        ctx  = await browser.new_context(
-            storage_state=COOKIES_FILE,
-            viewport={'width': 1280, 'height': 720}
-        )
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        ctx  = await browser.new_context(storage_state=COOKIES_FILE, viewport={'width': 1280, 'height': 720})
         page = await ctx.new_page()
+        
+        # 💓 START HEARTBEAT
+        heartbeat_task = asyncio.create_task(heartbeat(page))
 
-        if not await open_jazzdrive(page):
-            await browser.close(); return False
-
+        if not await open_jazzdrive(page): await browser.close(); return
         await navigate_to_folder(page, folder)
-
-        if not await click_upload_button(page):
-            await browser.close(); return False
-
-        if not await set_files_via_dialog(page, valid):
-            await browser.close(); return False
-
-        await asyncio.sleep(4)
-        success = await wait_upload_done(page)
-
-        if success:
-            for f in valid:
-                try: os.remove(f)
-                except: pass
-            print("  🗑️ Local files delete ho gayi")
-
+        if await click_upload_button(page):
+            await set_files_via_dialog(page, file_paths)
+            await wait_upload_done(page)
+        
+        heartbeat_task.cancel() # STOP HEARTBEAT
         await browser.close()
-        return success
-
-
-# ─────────────────────────────────────────
-# ℹ️  yt-dlp VERSION CHECK
-# ─────────────────────────────────────────
-def check_ytdlp_version():
-    try:
-        import subprocess
-        result = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True)
-        ver = result.stdout.strip()
-        print(f"  📦 yt-dlp version: {ver}")
-        # If version < 2024, warn
-        parts = ver.split('.')
-        if len(parts) >= 1:
-            year = int(parts[0])
-            if year < 2024:
-                print("  ⚠️ yt-dlp purana hai! Update karo:")
-                print("     pip install -U yt-dlp")
-    except:
-        pass
-
 
 # ─────────────────────────────────────────
 # 🚀  MAIN EXECUTION
@@ -887,92 +685,25 @@ async def main():
     print("  📺  YouTube (HD/4K) | Drive | MediaFire | Direct Links")
     print("=" * 55)
 
-    check_ytdlp_version()
-
     if not os.path.exists(COOKIES_FILE):
-        print("\n⚠️  Jazz cookies nahi mili!")
         num = input("📱 Jazz number (03xxxxxxxxx): ").strip()
-        if not await jazz_login(num):
-            print("❌ Login fail! Band ho raha hai.")
-            return
-    else:
-        print(f"\n✅ Jazz cookies mil gayi | Cache: {len(cache.data)} entries")
-
+        await jazz_login(num)
+    
     while True:
-        print("\n" + "─" * 50)
-        print("  1  Links do   [YouTube/Drive/MediaFire → JazzDrive]")
-        print("  2  Sirf Upload [downloads/ folder ki files]")
-        print("  3  Login dobara [cookies expire ho gayi]")
-        print("  c  Cache clear [JazzDrive UI change hone pe]")
-        print("  x  Exit")
-        print("─" * 50)
+        print("\n  1: Link Download/Upload | 2: Batch Upload | 3: Login | c: Clear Cache | x: Exit")
         ch = input("👉 Choice: ").strip()
-
-        # ── Exit ──
-        if ch.lower() in ['x', 'exit']:
-            print("👋 Bot band ho raha hai. Allah Hafiz!")
-            break
-
-        # ── Cache Clear ──
-        elif ch.lower() == 'c':
-            cache.clear_all()
-            print("✅ Cache clear ho gaya!")
-
-        # ── Re-Login ──
+        if ch.lower() in ['x', 'exit']: break
+        elif ch.lower() == 'c': cache.clear_all()
         elif ch == '3':
-            if os.path.exists(COOKIES_FILE):
-                os.remove(COOKIES_FILE)
+            if os.path.exists(COOKIES_FILE): os.remove(COOKIES_FILE)
             num = input("📱 Jazz number (03xxxxxxxxx): ").strip()
             await jazz_login(num)
-
-        # ── Batch Upload ──
         elif ch == '2':
-            EXTS = ('.mp4', '.mkv', '.webm', '.zip', '.rar', '.mp3', '.m4a', '.mov')
-            existing = [
-                os.path.join("downloads", f)
-                for f in os.listdir("downloads")
-                if f.lower().endswith(EXTS)
-            ]
-            if not existing:
-                print("❌ downloads/ mein koi media file nahi!")
-                continue
-            print(f"  📂 {len(existing)} files mili:")
-            for f in existing:
-                mb = os.path.getsize(f) / 1e6
-                print(f"     • {os.path.basename(f)[:45]} ({mb:.0f}MB)")
-            folder = input("📁 JazzDrive folder (Enter=ROOT): ").strip()
-            await batch_upload(existing, folder)
-
-        # ── Download + Upload ──
+            existing = [os.path.join("downloads", f) for f in os.listdir("downloads") if f.endswith(('.mp4', '.mkv', '.webm', '.zip', '.rar'))]
+            if existing: await batch_upload(existing, input("📁 Folder: ").strip())
         else:
-            urls = [u for u in ch.split() if u.startswith('http')]
-            if not urls:
-                raw = input("🔗 Link(s) paste karo (space separated):\n> ").strip()
-                urls = [u for u in raw.split() if u.startswith('http')]
-            if not urls:
-                print("❌ Koi valid link nahi mila!")
-                continue
+            urls = input("🔗 Link(s): ").split()
+            if urls: await pipeline(urls, "1080", input("📁 Folder: ").strip())
 
-            # Quality selection (only for YouTube)
-            quality = "1080"
-            if any(any(x in u for x in ["youtube.com", "youtu.be"]) for u in urls):
-                print("\n🎬 Video Quality:")
-                print("   1 = 4K (2160p)   2 = 2K (1440p)")
-                print("   3 = 1080p HD     4 = 720p")
-                print("   5 = 480p         6 = 360p (data save)")
-                q = input("👉 Quality (default=3 → 1080p): ").strip()
-                quality = {
-                    "1": "2160", "2": "1440", "3": "1080",
-                    "4": "720",  "5": "480",  "6": "360"
-                }.get(q, "1080")
-                print(f"  ✅ Quality: {quality}p selected")
-
-            folder = input("📁 JazzDrive folder (Enter=ROOT): ").strip()
-            await pipeline(urls, quality, folder)
-
-
-# ─────────────────────────────────────────
-# Entry Point
-# ─────────────────────────────────────────
 if __name__ == "__main__":
     asyncio.run(main())
