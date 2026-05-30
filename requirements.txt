@@ -1,9 +1,5 @@
-python-telegram-bot==20.0
+pyTelegramBotAPI
+playwright
 requests
 requests-toolbelt
-aiohttp
-aiofiles
-gdown
-playwright
-nest-asyncio
 yt-dlp
