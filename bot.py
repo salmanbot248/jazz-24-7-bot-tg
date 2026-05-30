@@ -1,709 +1,596 @@
-# ==========================================
-# 🤖 KAREEM BOT v4.1 - HIGH QUALITY FIXED
-# 📸 YouTube (HD/4K) | Google Drive | MediaFire | Direct Links
-# 🧠 Smart Cache | 🔄 Multi-Client Auto-Retry | ⚡ Fast Download
-# 💓 Heartbeat Included (Keep Alive)
-# ==========================================
+import os
+import json
+import time
+import asyncio
+import random
+import re
+import mimetypes
+import uuid
+import shutil
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urljoin
 
-import os, asyncio, time, json, re, requests, gdown
-import nest_asyncio, yt_dlp
-from playwright.async_api import async_playwright
+from pyrogram import Client, filters, idle
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import requests
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import nest_asyncio
+import aiohttp
+from aiohttp import web
+import aiofiles
+import gdown
 
 nest_asyncio.apply()
 
-CACHE_FILE    = "selector_cache.json"
-COOKIES_FILE  = "jazz_cookies.json"
-JAZZDRIVE_URL = "https://cloud.jazzdrive.com.pk/#folders"
-LOGIN_URL     = "https://cloud.jazzdrive.com.pk/login"
+# --- TELEGRAM BOT CREDENTIALS ---
+API_ID = os.environ.get("API_ID", "YOUR_API_ID_HERE")
+API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-os.makedirs("downloads",   exist_ok=True)
-os.makedirs("screenshots", exist_ok=True)
+if not all([API_ID, API_HASH, BOT_TOKEN]):
+    print("❌ ERROR: API_ID, API_HASH, or BOT_TOKEN secrets are not set!")
+    exit(1)
 
-# ─────────────────────────────────────────
-# 💓 HEARTBEAT (Session Keep Alive)
-# ─────────────────────────────────────────
-async def heartbeat(page):
-    """ہر 5 منٹ بعد پیج کو ریفریش کرتا ہے تاکہ کوکیز ایکسپائر نہ ہوں"""
-    while True:
-        await asyncio.sleep(300) # 5 minutes wait
-        try:
-            await page.reload()
-            print(f"\n💓 [Heartbeat] JazzDrive pinged at: {time.strftime('%H:%M:%S')}")
-        except Exception as e:
-            print(f"  ⚠️ Heartbeat error: {e}")
-            break
+app = Client("jazz_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ─────────────────────────────────────────
-# 💾  SELECTOR CACHE
-# ─────────────────────────────────────────
-class SelectorCache:
-    def __init__(self):
-        self.data = {}
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE) as f:
-                    self.data = json.load(f)
-                print(f"💾 Cache: {len(self.data)} entries")
-            except:
-                pass
+# --- ADMIN & MULTI-USER SYSTEM ---
+ADMIN_ID = 7128257853
+ALLOWED_USERS_FILE = "allowed_users.json"
+SETTINGS_FILE = "bot_settings.json"
 
-    def get(self, key):
-        return self.data.get(key)
+user_states = {}
+user_pending_jobs = {} 
+active_tasks = {} 
+login_events = {}
+cancelled_tasks = set()
+user_active_tasks = {} 
 
-    def save(self, key, sel):
-        self.data[key] = sel
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(self.data, f, indent=2)
+user_semaphores = {}
+user_queue_counts = {}
 
-    def forget(self, key):
-        if key in self.data:
-            del self.data[key]
-            with open(CACHE_FILE, 'w') as f:
-                json.dump(self.data, f, indent=2)
-            print(f"  🗑️ Cache forget: {key}")
+def load_allowed_users():
+    if not os.path.exists(ALLOWED_USERS_FILE):
+        with open(ALLOWED_USERS_FILE, "w") as f:
+            json.dump([ADMIN_ID], f)
+    with open(ALLOWED_USERS_FILE, "r") as f:
+        return set(json.load(f))
 
-    def clear_all(self):
-        self.data = {}
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        default_settings = {"owner_concurrent": 3, "user_concurrent": 3, "ping_interval": 5}
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(default_settings, f)
+        return default_settings
+    with open(SETTINGS_FILE, "r") as f:
+        data = json.load(f)
+        if "owner_concurrent" not in data: data["owner_concurrent"] = data.get("max_concurrent", 3)
+        return data
 
-cache = SelectorCache()
+allowed_users = load_allowed_users()
+bot_settings = load_settings()
 
-# ─────────────────────────────────────────
-# 🔇  SILENT LOGGER
-# ─────────────────────────────────────────
-class SilentLogger:
-    def debug(self, msg):   pass
-    def warning(self, msg): pass
-    def error(self, msg):   pass
+# --- HELPER FUNCTIONS ---
+def get_cookie_file(user_id):
+    return f"jazz_cookies_{user_id}.json"
 
-# ─────────────────────────────────────────
-# 📸  SCREENSHOT
-# ─────────────────────────────────────────
-async def take_ss(page, name):
-    path = f"screenshots/{name}_{int(time.time())}.png"
+def load_cookies(user_id):
+    cookie_file = get_cookie_file(user_id)
+    if not os.path.exists(cookie_file): return None, None
     try:
-        await page.screenshot(path=path)
-        print(f"  📸 {path}")
-    except:
-        pass
+        with open(cookie_file, 'r') as f:
+            data = json.load(f)
+        raw_cookies = data.get('cookies', [])
+        cookies = {c['name']: c['value'] for c in raw_cookies}
+        key = next((c['value'] for c in raw_cookies if c['name'] == 'validationKey'), None)
+        return cookies, key
+    except Exception: return None, None
 
-# ─────────────────────────────────────────
-# 🌐  JAZZDRIVE OPEN
-# ─────────────────────────────────────────
-async def open_jazzdrive(page):
-    print("🌐 JazzDrive khul raha hai...")
+def get_cloud_folders(cookies, key):
+    session = requests.Session()
+    url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}"
     try:
-        await page.goto(JAZZDRIVE_URL, timeout=90000)
-        await page.wait_for_load_state("domcontentloaded", timeout=20000)
-        await asyncio.sleep(5)
-    except Exception as e:
-        print(f"  ⚠️ Load slow: {e}")
-
-    if "login" in page.url.lower():
-        print("❌ Cookies expire! Login karo dobara.")
-        if os.path.exists(COOKIES_FILE):
-            os.remove(COOKIES_FILE)
-        return False
-
-    for chk in ["#uploadActionButton", "button[aria-label='upload']", ".NavigationEntry"]:
-        try:
-            if await page.is_visible(chk, timeout=3000):
-                print("  ✅ JazzDrive ready")
-                return True
-        except:
-            continue
-
-    if "jazzdrive" in page.url and "login" not in page.url:
-        print("  ✅ JazzDrive loaded")
-        return True
-
-    await take_ss(page, "WARN_state")
-    return True
-
-# ─────────────────────────────────────────
-# 📂  FOLDER NAVIGATE
-# ─────────────────────────────────────────
-async def navigate_to_folder(page, folder_name):
-    if not folder_name or folder_name.strip().upper() in ["ROOT", ""]:
-        print("  📁 ROOT mein upload hoga")
-        return True
-
-    fn = folder_name.strip()
-    print(f"  📂 Folder dhundh raha hai: '{fn}'")
-
-    for sel in [f"text={fn}", f".mdl-list__item:has-text('{fn}')", f"li:has-text('{fn}')"]:
-        try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=3000):
-                await loc.click(timeout=4000)
-                await asyncio.sleep(3)
-                print(f"  ✅ Folder mila: {fn}")
-                return True
-        except:
-            continue
-
-    for exact in [True, False]:
-        try:
-            await page.get_by_text(fn, exact=exact).first.click(timeout=4000)
-            await asyncio.sleep(3)
-            print(f"  ✅ Folder (text): {fn}")
-            return True
-        except:
-            continue
-
-    try:
-        found = await page.evaluate(f"""
-            (function() {{
-                const t = '{fn.lower()}';
-                const els = document.querySelectorAll('[class*="FolderName"],[class*="folder"],li,td');
-                for (const el of els) {{
-                    if ((el.textContent||'').trim().toLowerCase() === t) {{ el.click(); return true; }}
-                }}
-                for (const el of els) {{
-                    if ((el.textContent||'').toLowerCase().includes(t)) {{ el.click(); return true; }}
-                }}
-                return false;
-            }})()
-        """)
-        if found:
-            await asyncio.sleep(3)
-            print(f"  ✅ Folder (JS): {fn}")
-            return True
-    except:
-        pass
-
-    print(f"  ⚠️ Folder '{fn}' nahi mila — ROOT mein upload hoga")
-    return False
-
-# ─────────────────────────────────────────
-# ⬆️  UPLOAD BUTTON CLICK
-# ─────────────────────────────────────────
-async def click_upload_button(page):
-    cached = cache.get("upload_btn")
-    if cached:
-        try:
-            el = page.locator(cached).first
-            await el.wait_for(state="visible", timeout=4000)
-            await el.click(timeout=4000)
-            print("  💾 Upload btn (cache)")
-            return True
-        except:
-            cache.forget("upload_btn")
-
-    selectors = [
-        "#uploadActionButton",
-        "button[aria-label='upload']",
-        "button[id='uploadActionButton']",
-        "button.MuiIconButton-root[aria-label='upload']",
-        "button[aria-label*='upload' i]",
-        "button[class*='css-1yxmbwk']",
-        "#topbarContainer button:last-of-type",
-        ".TopBarActions button",
-        "header button:last-of-type",
-    ]
-
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            await el.wait_for(state="visible", timeout=3000)
-            await el.click(timeout=3000)
-            cache.save("upload_btn", sel)
-            print(f"  ✅ Upload btn: {sel}")
-            return True
-        except:
-            continue
-
-    try:
-        ok = await page.evaluate("""
-            (function(){
-                let b = document.getElementById('uploadActionButton');
-                if (b) { b.click(); return true; }
-                b = document.querySelector("button[aria-label='upload']");
-                if (b) { b.click(); return true; }
-                const icons = document.querySelectorAll('[data-testid="CloudUploadIcon"]');
-                if (icons.length) {
-                    const btn = icons[0].closest('button');
-                    if (btn) { btn.click(); return true; }
-                }
-                return false;
-            })()
-        """)
-        if ok:
-            print("  ✅ Upload btn (JS)")
-            return True
-    except:
-        pass
-
-    await take_ss(page, "FAIL_uploadbtn")
-    print("  ❌ Upload button nahi mila!")
-    return False
-
-# ─────────────────────────────────────────
-# 📁  DIALOG → "Upload files" → FILE SET
-# ─────────────────────────────────────────
-async def set_files_via_dialog(page, file_paths):
-    files = file_paths if isinstance(file_paths, list) else [file_paths]
-    print(f"  📄 Files: {[os.path.basename(f) for f in files]}")
-
-    await asyncio.sleep(2.5)
-
-    dialog_ok = False
-    for d in ["[role='dialog']", ".MuiDialog-paper", ".DialogForm",
-              ".OptionsListContainer", ".OptionName"]:
-        try:
-            if await page.is_visible(d, timeout=4000):
-                dialog_ok = True
+        res = session.get(url, cookies=cookies, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        data = res.json()
+        folders_list = data.get('data', {}).get('folders', [])
+        root_id = None
+        for f in folders_list:
+            if f.get('name') == '/':
+                root_id = f.get('id')
                 break
-        except:
-            continue
+        if not root_id: return [], None
+        sub_folders = [(f['name'], f['id']) for f in folders_list if f.get('parentid') == root_id and f.get('name') != '/']
+        return sub_folders, root_id
+    except Exception: return [], None
 
-    if not dialog_ok:
-        await take_ss(page, "WARN_nodialog")
-        print("  ⚠️ Dialog nahi aya — direct input try")
-        return await _direct_input(page, files)
-
-    option_selectors = [
-        ".OptionName",
-        "div.OptionName",
-        ".OptionsListContainer .OptionName",
-        ".OptionContainer .OptionName",
-        ".OptionLabel .OptionName",
-        "text=Upload files",
-        ":text('Upload files')",
-        ".OptionContainer:first-child .OptionName",
-        "[class='OptionName']",
-    ]
-
-    for sel in option_selectors:
-        try:
-            async with page.expect_file_chooser(timeout=7000) as fc_info:
-                loc = page.locator(sel).first
-                await loc.wait_for(state="visible", timeout=3000)
-                await loc.click(timeout=3000)
-            fc = await fc_info.value
-            await fc.set_files(files)
-            print(f"  ✅ File chooser via: {sel}")
-            return True
-        except:
-            continue
-
+def create_cloud_folder(name, parent_id, cookies, key):
+    session = requests.Session()
+    url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=save&validationkey={key}"
+    payload = {"data": {"magic": False, "offline": False, "name": name, "parentid": int(parent_id)}}
     try:
-        containers = page.locator(".OptionContainer")
-        if await containers.count() > 0:
-            async with page.expect_file_chooser(timeout=7000) as fc_info:
-                await containers.first.click(timeout=3000)
-            fc = await fc_info.value
-            await fc.set_files(files)
-            print("  ✅ File chooser via .OptionContainer[0]")
-            return True
-    except:
-        pass
+        res = session.post(url, cookies=cookies, json=payload, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        d = res.json()
+        new_id = d.get('id') or d.get('data', {}).get('id')
+        return new_id if new_id else parent_id
+    except Exception: return parent_id
 
-    print("  ⚠️ Dialog option click fail — ESC + direct input")
-    try:
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(1)
-    except:
-        pass
+def format_bytes(size):
+    if size <= 0: return "0 B"
+    size = float(size)
+    power = 2**10
+    n = 0
+    power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+    while size >= power and n < 4:
+        size /= power
+        n += 1
+    return f"{round(size, 2)} {power_labels[n]}"
 
-    return await _direct_input(page, files)
+class MultiProgressTracker:
+    def __init__(self, message, total_files, is_batch=False):
+        self.message = message
+        self.total_files = total_files
+        self.is_batch = is_batch
+        self.tasks = {}
+        self.last_update_time = time.time()
+        self.file_counter = 1
 
-async def _direct_input(page, files):
-    await page.evaluate("""
-        document.querySelectorAll('input[type="file"]').forEach(el => {
-            el.style.cssText =
-                'display:block!important;visibility:visible!important;' +
-                'opacity:1!important;width:1px;height:1px;' +
-                'position:fixed;top:0;left:0;z-index:99999;';
-            el.removeAttribute('hidden');
-        });
-    """)
-    await asyncio.sleep(0.5)
-    try:
-        inp = page.locator("input[type='file']").first
-        await inp.set_input_files(files)
-        print("  ✅ Direct file input set")
-        return True
-    except Exception as e:
-        await take_ss(page, "FAIL_fileset")
-        print(f"  ❌ File set fail: {e}")
-        return False
+    def init_task(self, task_id, filename):
+        self.tasks[task_id] = {
+            "index": self.file_counter, "name": filename, "action": "Queued", 
+            "size": 0, "dl_current": 0, "dl_speed": 0, "dl_start": 0,
+            "ul_current": 0, "ul_speed": 0, "ul_start": 0
+        }
+        self.file_counter += 1
 
-# ─────────────────────────────────────────
-# ✅  WAIT FOR UPLOAD COMPLETE
-# ─────────────────────────────────────────
-async def wait_upload_done(page, timeout_min=120):
-    SUCCESS = [
-        "Uploads completed", "Upload complete",
-        "uploaded successfully", "All files uploaded",
-    ]
-    print(f"  ⏳ Upload complete hone ka wait ({timeout_min} min max)...")
+    async def update_dl(self, task_id, current, total):
+        task = self.tasks.get(task_id)
+        if not task: return
+        now = time.time()
+        if task["dl_start"] == 0: task["dl_start"] = now
+        task["dl_current"] = current
+        if total > 0: task["size"] = total
+        dt = now - task["dl_start"]
+        task["dl_speed"] = current / dt if dt > 0 else 0
+        task["action"] = "Downloading"
+        await self._render_ui(force=False)
 
-    for i in range(timeout_min * 60):
-        for txt in SUCCESS:
-            try:
-                if await page.is_visible(f"text={txt}", timeout=300):
-                    print(f"\n  🎉 Upload Done! ({txt})")
-                    return True
-            except:
-                pass
-        if i % 120 == 0 and i > 0:
-            try:
-                body = await page.inner_text("body")
-                pcts = [w for w in body.split() if '%' in w and w[:-1].isdigit()]
-                print(f"  ⬆️ {i//60} min: {pcts[-1] if pcts else 'upload jari hai...'}")
-            except:
-                pass
-        await asyncio.sleep(1)
+    async def update_ul(self, task_id, current, total):
+        task = self.tasks.get(task_id)
+        if not task: return
+        now = time.time()
+        if task["ul_start"] == 0: task["ul_start"] = now
+        task["ul_current"] = current
+        if total > 0: task["size"] = total
+        dt = now - task["ul_start"]
+        task["ul_speed"] = current / dt if dt > 0 else 0
+        task["action"] = "Uploading"
+        await self._render_ui(force=False)
 
-    print(f"  ⚠️ Timeout! Manually check karo.")
-    return False
+    async def update_status_only(self, task_id, action):
+        task = self.tasks.get(task_id)
+        if not task: return
+        task["action"] = action
+        await self._render_ui(force=True)
 
-# ─────────────────────────────────────────
-# 🌐  JAZZDRIVE LOGIN (OTP)
-# ─────────────────────────────────────────
-async def jazz_login(number):
-    async with async_playwright() as p:
-        print(f"\n🌐 Login ho raha hai: {number}")
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
-        )
-        ctx  = await browser.new_context(viewport={'width': 1280, 'height': 720})
-        page = await ctx.new_page()
-        try:
-            await page.goto(LOGIN_URL, timeout=90000)
-            await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(5)
-
-            num = number.strip()
-            for sel in ["input[type='tel']", "input[type='number']", "input"]:
-                try:
-                    await page.fill(sel, num, timeout=3000)
-                    print(f"  ✅ Number fill: {sel}")
-                    break
-                except:
-                    continue
-
-            await asyncio.sleep(1)
-            for sel in ["#signinbtn", "button[type='submit']", "button"]:
-                try:
-                    await page.click(sel, timeout=3000)
-                    print("  ✅ OTP button clicked")
-                    break
-                except:
-                    continue
-
-            print("📲 OTP aa raha hai — 12 second wait...")
-            await asyncio.sleep(12)
-            await page.screenshot(path="screenshots/otp_page.png")
-            otp = input("\n👉 OTP enter karo: ").strip()
-
-            for sel in ["#otp", "input[name='otp']", "input[type='number']", "input:visible"]:
-                try:
-                    await page.click(sel, timeout=2000)
-                    break
-                except:
-                    continue
-
-            for d in otp:
-                await page.keyboard.press(d)
-                await asyncio.sleep(0.25)
-
-            await page.keyboard.press("Enter")
-            await asyncio.sleep(10)
-            await ctx.storage_state(path=COOKIES_FILE)
-            print("✅ Login successful!")
-            return True
-        except Exception as e:
-            print(f"❌ Login fail: {e}")
-            return False
-        finally:
-            await browser.close()
-
-# ─────────────────────────────────────────
-# 📋  PLAYLIST / LINK FETCH
-# ─────────────────────────────────────────
-def get_playlist_entries(link):
-    if any(x in link for x in ["drive.google.com", "mediafire.com"]) or \
-       not any(x in link for x in ["youtube.com", "youtu.be"]):
-        return [{'url': link, 'webpage_url': link, 'title': 'Cloud_or_Direct_File'}]
-
-    ck = next((n for n in ['cookies.txt', 'youtube.com_cookies.txt', 'yt_cookies.txt']
-               if os.path.exists(n)), None)
-    opts = {
-        'quiet': True, 'no_warnings': True,
-        'extract_flat': 'in_playlist',
-        'ignoreerrors': True, 'logger': SilentLogger(),
-    }
-    if ck: opts['cookiefile'] = ck
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(link, download=False)
-            if not info: return []
-            if 'entries' in info:
-                out = []
-                for e in info['entries']:
-                    if not e: continue
-                    vid = e.get('webpage_url') or e.get('url', '')
-                    if not vid.startswith('http') and e.get('id') and 'youtube' in link:
-                        vid = f"https://www.youtube.com/watch?v={e['id']}"
-                    if vid:
-                        out.append({'url': vid, 'webpage_url': vid,
-                                    'title': e.get('title', f'V{len(out)+1}')})
-                print(f"  📋 Playlist mein {len(out)} videos mili")
-                return out
-            url = info.get('webpage_url') or link
-            return [{'url': url, 'webpage_url': url, 'title': info.get('title', 'Video')}]
-    except Exception as e:
-        print(f"  ❌ Playlist fetch fetch fail: {e}")
-        return []
-
-# ─────────────────────────────────────────
-# 📂  GOOGLE DRIVE DOWNLOAD
-# ─────────────────────────────────────────
-def download_from_google_drive(url, idx):
-    print(f"  🤖 Google Drive link detect hua...")
-    match = re.search(r'/d/([a-zA-Z0-9-_]+)', url) or re.search(r'id=([a-zA-Z0-9-_]+)', url)
-    if match:
-        file_id = match.group(1)
-        try:
-            print(f"  📥 Google Drive se download ho rahi hai...")
-            filepath = gdown.download(id=file_id, output="downloads/", quiet=True, fuzzy=True)
-            if filepath and os.path.exists(filepath):
-                filename = os.path.basename(filepath)
-                new_path = os.path.join("downloads", f"{idx:02d}_{filename}")
-                os.rename(filepath, new_path)
-                mb = os.path.getsize(new_path) / 1e6
-                print(f"  ✅ GD Complete: {os.path.basename(new_path)} | {mb:.0f}MB")
-                return new_path
-        except Exception as e:
-            print(f"  ❌ Google Drive fail: {e}")
-    return None
-
-# ─────────────────────────────────────────
-# 🔥  MEDIAFIRE DOWNLOAD
-# ─────────────────────────────────────────
-def download_from_mediafire(url, idx):
-    print(f"  🤖 MediaFire link detect hua...")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        res = requests.get(url, headers=headers, timeout=20)
-        match = re.search(r'https?://download[0-9]+\.mediafire\.com/[^\s"\'>]+', res.text)
-        if match:
-            direct_url = match.group(0)
-            filename = direct_url.split('/')[-2].split('?')[0] if '/' in direct_url else "mediafire_file"
-            out_path = f"downloads/{idx:02d}_{filename}"
-            print(f"  📥 MediaFire direct download: {filename}...")
-            with requests.get(direct_url, headers=headers, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                if 'content-disposition' in r.headers:
-                    fname_match = re.search(r'filename="([^"]+)"', r.headers['content-disposition'])
-                    if fname_match:
-                        filename = fname_match.group(1)
-                        out_path = f"downloads/{idx:02d}_{filename}"
-                with open(out_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk: f.write(chunk)
-            mb = os.path.getsize(out_path) / 1e6
-            print(f"  ✅ MediaFire Complete: {filename} | {mb:.0f}MB")
-            return out_path
-        else:
-            print("  ❌ MediaFire direct link nahi mila!")
-    except Exception as e:
-        print(f"  ❌ MediaFire fail: {e}")
-    return None
-
-# ─────────────────────────────────────────
-# 🔗  GENERIC DIRECT DOWNLOAD
-# ─────────────────────────────────────────
-def download_generic_file(url, idx):
-    print(f"  🤖 Direct URL detect hua...")
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        filename = url.split('/')[-1].split('?')[0]
-        if not filename or '.' not in filename:
-            filename = "direct_file.mp4"
-        out_path = f"downloads/{idx:02d}_{filename}"
-        print(f"  📥 Stream download ho rahi hai: {filename}...")
-        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            total_size = int(r.headers.get('content-length', 0))
-            downloaded = 0
-            with open(out_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-            mb = downloaded / 1e6
-        print(f"  ✅ Direct Complete: {filename} | {mb:.0f}MB")
-        return out_path
-    except Exception as e:
-        print(f"  ❌ Direct download fail: {e}")
-        return None
-
-# ─────────────────────────────────────────
-# 📥  YOUTUBE DOWNLOAD
-# ─────────────────────────────────────────
-def download_one(url, idx, total, quality):
-    if not url.startswith('http'):
-        return None
-    print(f"\n  🔗 [{idx}/{total}] {url[:80]}")
-    if "drive.google.com" in url: return download_from_google_drive(url, idx)
-    if "mediafire.com"    in url: return download_from_mediafire(url, idx)
-    if not any(x in url for x in ["youtube.com", "youtu.be"]):
-        return download_generic_file(url, idx)
-
-    ck = next((n for n in ['cookies.txt', 'youtube.com_cookies.txt', 'yt_cookies.txt']
-               if os.path.exists(n)), None)
-    
-    fmt = (f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
-           f'bestvideo[height<={quality}]+bestaudio/'
-           f'best[height<={quality}]/best')
-
-    BASE_OPTS = {
-        'format': fmt,
-        'merge_output_format': 'mp4',
-        'outtmpl': f'downloads/{idx:02d}_%(title)s.%(ext)s',
-        'restrictfilenames': True,
-        'noplaylist': True,
-        'quiet': False,
-        'noprogress': True,
-        'retries': 5,
-        'fragment_retries': 5,
-        'concurrent_fragment_downloads': 4,
-        'socket_timeout': 30,
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
-        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
-    }
-    if ck: BASE_OPTS['cookiefile'] = ck
-
-    try:
-        with yt_dlp.YoutubeDL(BASE_OPTS) as ydl:
-            info = ydl.extract_info(url, download=True)
-            fpath = ydl.prepare_filename(info).replace('.webm', '.mp4').replace('.mkv', '.mp4')
-            if not os.path.exists(fpath): # Fallback
-                for f in os.listdir('downloads'):
-                    if f.startswith(f'{idx:02d}_'): fpath = os.path.join('downloads', f)
-            return fpath
-    except Exception as e:
-        print(f"  ❌ Youtube download fail: {e}")
-        return None
-
-# ─────────────────────────────────────────
-# ✂️  FILE SPLIT
-# ─────────────────────────────────────────
-def split_file(path, max_mb=1900):
-    mb = os.path.getsize(path) / 1e6
-    if mb <= 1990: return [path]
-    print(f"  ✂️ {mb:.0f}MB — 2GB limit ke liye split ho raha hai...")
-    base, ext = os.path.splitext(path)
-    parts = []
-    try:
-        import subprocess
-        probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path], capture_output=True, text=True)
-        dur = float(json.loads(probe.stdout)["format"]["duration"])
-        pd = dur * (max_mb / mb)
-        for i in range(int(dur / pd) + 1):
-            s = i * pd
-            if s >= dur: break
-            pp = f"{base}_part{i+1:02d}{ext}"
-            subprocess.run(["ffmpeg", "-y", "-ss", str(s), "-i", path, "-t", str(pd), "-c", "copy", "-avoid_negative_ts", "make_zero", pp], capture_output=True)
-            if os.path.exists(pp): parts.append(pp)
-        if parts: os.remove(path)
-        return parts
-    except: return [path]
-
-# ─────────────────────────────────────────
-# 🚀  MAIN PIPELINE (Download → Upload)
-# ─────────────────────────────────────────
-async def pipeline(url_list, quality, folder):
-    loop = asyncio.get_event_loop()
-    all_entries = []
-    for u in url_list:
-        ents = get_playlist_entries(u)
-        if not ents: ents = [{'url': u, 'webpage_url': u, 'title': 'File'}]
-        all_entries.extend(ents)
-
-    total = len(all_entries)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        ctx  = await browser.new_context(storage_state=COOKIES_FILE, viewport={'width': 1280, 'height': 720})
-        page = await ctx.new_page()
-
-        # 💓 START HEARTBEAT
-        heartbeat_task = asyncio.create_task(heartbeat(page))
-
-        if not await open_jazzdrive(page):
-            await browser.close(); return
-
-        await navigate_to_folder(page, folder)
-
-        for idx, entry in enumerate(all_entries, 1):
-            fpath = await loop.run_in_executor(None, download_one, entry.get('webpage_url') or entry.get('url', ''), idx, total, quality)
-            if not fpath: continue
+    async def _render_ui(self, force=False):
+        now = time.time()
+        if not force and (now - self.last_update_time < 6.0): return
+        self.last_update_time = now
+        
+        text = f"📦 **Processing [{self.total_files} Files]**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        for tid, t in self.tasks.items():
+            text += f"📄 **{t['index']}. {t['name']}**\n"
+            text += f"├ 📈 **Status:** {t['action']}\n"
             
-            parts = split_file(fpath)
-            for part in parts:
-                if not await click_upload_button(page): continue
-                if not await set_files_via_dialog(page, part): continue
-                await asyncio.sleep(2)
-        
-        await wait_upload_done(page)
-        heartbeat_task.cancel() # STOP HEARTBEAT
-        await browser.close()
+            if t["action"] in ["Downloading", "Uploading"]:
+                is_dl = t["action"] == "Downloading"
+                current = t["dl_current"] if is_dl else t["ul_current"]
+                speed = t["dl_speed"] if is_dl else t["ul_speed"]
+                total = t["size"]
+                pct = (current / total * 100) if total > 0 else 0
+                text += f"├ 📊 {format_bytes(current)} / {format_bytes(total)} (⚡ {format_bytes(speed)}/s) [{pct:.1f}%]\n"
+            text += "\n"
 
-# ─────────────────────────────────────────
-# 📦  BATCH UPLOAD
-# ─────────────────────────────────────────
-async def batch_upload(file_paths, folder):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        ctx  = await browser.new_context(storage_state=COOKIES_FILE, viewport={'width': 1280, 'height': 720})
-        page = await ctx.new_page()
-        
-        # 💓 START HEARTBEAT
-        heartbeat_task = asyncio.create_task(heartbeat(page))
+        try:
+            if len(text) > 4000: text = text[:3900] + "\n... (Truncated)"
+            await self.message.edit_text(text, disable_web_page_preview=True)
+        except Exception: pass
 
-        if not await open_jazzdrive(page): await browser.close(); return
-        await navigate_to_folder(page, folder)
-        if await click_upload_button(page):
-            await set_files_via_dialog(page, file_paths)
-            await wait_upload_done(page)
-        
-        heartbeat_task.cancel() # STOP HEARTBEAT
-        await browser.close()
+# --- DOWNLOADERS (Raw CDN, MediaFire, Google Drive) ---
+async def download_mediafire_direct(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20) as res:
+            text = await res.text()
+            match = re.search(r'https?://download[0-9]+\.mediafire\.com/[^\s"\'>]+', text)
+            if match: return match.group(0)
+    return url
 
-# ─────────────────────────────────────────
-# 🚀  MAIN EXECUTION
-# ─────────────────────────────────────────
-async def main():
-    print("\n" + "=" * 55)
-    print("  🤖  KAREEM BOT v4.1 — HIGH QUALITY FIXED")
-    print("  📺  YouTube (HD/4K) | Drive | MediaFire | Direct Links")
-    print("=" * 55)
+async def download_direct_link(url, filepath, task_id, tracker):
+    if "drive.google.com" in url:
+        await tracker.update_status_only(task_id, "Downloading from Google Drive")
+        loop = asyncio.get_event_loop()
+        file_id = re.search(r'/d/([a-zA-Z0-9-_]+)', url) or re.search(r'id=([a-zA-Z0-9-_]+)', url)
+        if file_id:
+            await loop.run_in_executor(None, lambda: gdown.download(id=file_id.group(1), output=filepath, quiet=True, fuzzy=True))
+            return filepath
+            
+    if "mediafire.com" in url:
+        await tracker.update_status_only(task_id, "Bypassing MediaFire...")
+        url = await download_mediafire_direct(url)
 
-    if not os.path.exists(COOKIES_FILE):
-        num = input("📱 Jazz number (03xxxxxxxxx): ").strip()
-        await jazz_login(num)
+    timeout = aiohttp.ClientTimeout(total=3600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}) as response:
+            response.raise_for_status()
+            total_size = int(response.headers.get('content-length', 0))
+            current_size = 0
+            
+            async with aiofiles.open(filepath, 'wb') as f:
+                async for chunk in response.content.iter_chunked(4 * 1024 * 1024): 
+                    if task_id in cancelled_tasks: raise asyncio.CancelledError()
+                    if chunk:
+                        await f.write(chunk)
+                        current_size += len(chunk)
+                        await tracker.update_dl(task_id, current_size, total_size)
+    return filepath
+
+# --- EXTRACTOR ---
+def extract_archive(filepath):
+    extract_dir = filepath + "_extracted"
+    os.makedirs(extract_dir, exist_ok=True)
+    extracted_files = []
+    try:
+        shutil.unpack_archive(filepath, extract_dir)
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                extracted_files.append(os.path.join(root, f))
+    except Exception as e:
+        print(f"Extraction failed: {e}")
+    return extracted_files
+
+# --- API LOGIN ---
+async def do_api_login(client, message, number, user_id):
+    msg = await message.reply("⚙️ *Initializing secure session...*")
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    loop = asyncio.get_event_loop()
     
+    try:
+        random_state = random.randint(10000, 99999)
+        auth_url = f"https://jazzdrive.com.pk/oauth2/authorization.php?response_type=code&client_id=web&state={random_state}&redirect_uri=https://cloud.jazzdrive.com.pk/ui/html/oauth.html"
+        res1 = await loop.run_in_executor(None, lambda: session.get(auth_url, timeout=15, allow_redirects=True))
+        signup_url = res1.url 
+        
+        post_url = signup_url
+        form_action_match = re.search(r'<form[^>]+action\s*=\s*["\']([^"\']+)["\']', res1.text, re.IGNORECASE)
+        if form_action_match: post_url = urljoin(signup_url, form_action_match.group(1).replace('&amp;', '&'))
+
+        payload = {}
+        for match in re.finditer(r'<input([^>]+)>', res1.text, re.IGNORECASE):
+            attr_str = match.group(1)
+            name_m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', attr_str, re.IGNORECASE)
+            val_m = re.search(r'value\s*=\s*["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
+            if name_m: payload[name_m.group(1)] = val_m.group(1) if val_m else ""
+                
+        payload['msisdn'] = number
+        if not any('submit' in k.lower() for k in payload.keys()): payload['submit'] = 'submit'
+
+        session.headers.update({'Referer': signup_url, 'Content-Type': 'application/x-www-form-urlencoded'})
+        res2 = await loop.run_in_executor(None, lambda: session.post(post_url, data=payload, timeout=15, allow_redirects=True))
+        verify_url = res2.url 
+        
+        if "verify.php" not in verify_url: return await msg.edit("❌ **Failed!** Server rejected the number.")
+    except Exception as e:
+        return await msg.edit(f"❌ **Error:**\n`{e}`")
+
+    await msg.edit("🔑 **OTP Sent!**\n\nEnter the **4-digit OTP** sent to your number.")
+    user_states[user_id] = "WAITING_FOR_OTP"
+    login_events[user_id] = asyncio.Future()
+    
+    try: otp = await asyncio.wait_for(login_events[user_id], timeout=300) 
+    except asyncio.TimeoutError: return await msg.edit("⏳ **Timeout!**")
+    
+    await msg.edit("⚙️ *Verifying OTP...*")
+    try:
+        post_url_otp = verify_url
+        form_action_match = re.search(r'<form[^>]+action\s*=\s*["\']([^"\']+)["\']', res2.text, re.IGNORECASE)
+        if form_action_match: post_url_otp = urljoin(verify_url, form_action_match.group(1).replace('&amp;', '&'))
+
+        otp_payload = {}
+        for match in re.finditer(r'<input([^>]+)>', res2.text, re.IGNORECASE):
+            attr_str = match.group(1)
+            name_m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', attr_str, re.IGNORECASE)
+            val_m = re.search(r'value\s*=\s*["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
+            if name_m: otp_payload[name_m.group(1)] = val_m.group(1) if val_m else ""
+                
+        otp_payload['otp'] = otp
+        if not any('submit' in k.lower() for k in otp_payload.keys()): otp_payload['submit'] = 'submit'
+        
+        session.headers.update({'Referer': verify_url})
+        res3 = await loop.run_in_executor(None, lambda: session.post(post_url_otp, data=otp_payload, timeout=15, allow_redirects=True))
+        parsed_url = urlparse(res3.url)
+        query_params = parse_qs(parsed_url.query)
+        
+        if 'code' not in query_params: return await msg.edit("❌ **Error:** Server rejected the OTP.")
+        auth_code = query_params['code'][0]
+        
+        oauth_api_url = f"https://cloud.jazzdrive.com.pk/sapi/login/oauth?action=login&platform=web&keytype=authorizationcode&key={auth_code}"
+        res4 = await loop.run_in_executor(None, lambda: session.get(oauth_api_url, timeout=15))
+        
+        val_key = res4.json().get('data', {}).get('validationkey') or res4.json().get('validationkey') or session.cookies.get('validationKey')
+                        
+        if val_key:
+            formatted_cookies = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path} for c in session.cookies]
+            if not any(c['name'] == 'validationKey' for c in formatted_cookies):
+                formatted_cookies.append({"name": "validationKey", "value": val_key, "domain": "cloud.jazzdrive.com.pk", "path": "/"})
+            with open(get_cookie_file(user_id), "w") as f: json.dump({"cookies": formatted_cookies}, f, indent=4)
+            return await msg.edit("✅ **Login Successful!**")
+        else: return await msg.edit("❌ **Error:** Failed to extract validation key.")
+    except Exception as e: return await msg.edit(f"❌ **Verification Error:**\n`{e}`")
+
+# --- USER COMMANDS ---
+@app.on_message(filters.command("login"))
+async def login_cmd(client, message):
+    if message.from_user.id not in allowed_users: return
+    user_id = message.from_user.id
+    if os.path.exists(get_cookie_file(user_id)):
+        await message.reply("⚠️ Active session found. Overwriting...")
+    user_states[user_id] = "WAITING_FOR_NUMBER"
+    await message.reply("📱 Enter your phone number **[03xxxxxxxxx]**:")
+
+@app.on_message(filters.command("link"))
+async def link_cmd(client, message):
+    if message.from_user.id not in allowed_users: return
+    command_text = message.text.replace("/link", "", 1).strip()
+    if not command_text or " - " not in command_text:
+        return await message.reply("⚠️ **Format:** `/link https://url - Name - .mp4`")
+    try:
+        parts = command_text.split(" - ")
+        job_data = {"is_batch": False, "extract": False, "batch_name": f"{parts[1].strip()}{parts[2].strip()}", "links": [{"url": parts[0].strip(), "filename": f"{parts[1].strip()}{parts[2].strip()}"}]}
+        try: await message.delete()
+        except: pass
+        await check_login_and_ask_folder(client, message, message.from_user.id, job_data)
+    except Exception: await message.reply("❌ Invalid format.")
+
+@app.on_message(filters.command("mlink"))
+async def mlink_cmd(client, message):
+    if message.from_user.id not in allowed_users: return
+    command_text = message.text.replace("/mlink", "", 1).strip()
+    lines = [line.strip() for line in command_text.split("\n") if line.strip()]
+    links_data = []
+    for line in lines:
+        if " - " in line:
+            parts = line.split(" - ")
+            links_data.append({"url": parts[0].strip(), "filename": f"{parts[1].strip()}{parts[2].strip()}"})
+        
+    if not links_data: return await message.reply("❌ No valid links found.")
+    user_id = message.from_user.id
+    job_data = {"is_batch": True, "extract": False, "links": links_data}
+    try: await message.delete()
+    except: pass
+    user_states[user_id] = {"action": "WAITING_FOR_BATCH_NAME", "data": job_data}
+    await message.reply(f"✅ {len(links_data)} links detected. Reply with **folder name**:")
+
+@app.on_message(filters.command("unzip"))
+async def unzip_cmd(client, message):
+    if message.from_user.id not in allowed_users: return
+    command_text = message.text.replace("/unzip", "", 1).strip()
+    if not command_text or " - " not in command_text:
+        return await message.reply("⚠️ **Format:** `/unzip https://url - Name - .zip`")
+    try:
+        parts = command_text.split(" - ")
+        job_data = {"is_batch": True, "extract": True, "batch_name": f"{parts[1].strip()}{parts[2].strip()}", "links": [{"url": parts[0].strip(), "filename": f"{parts[1].strip()}{parts[2].strip()}"}]}
+        try: await message.delete()
+        except: pass
+        await check_login_and_ask_folder(client, message, message.from_user.id, job_data)
+    except Exception: await message.reply("❌ Invalid format.")
+
+@app.on_message(filters.text & filters.private)
+async def text_handler(client, message):
+    if message.from_user.id not in allowed_users: return
+    user_id = message.from_user.id
+    state = user_states.get(user_id)
+
+    if state == "WAITING_FOR_NUMBER":
+        user_states[user_id] = None
+        asyncio.create_task(do_api_login(client, message, message.text, user_id))
+    elif state == "WAITING_FOR_OTP":
+        user_states[user_id] = None
+        if user_id in login_events and not login_events[user_id].done():
+            login_events[user_id].set_result(message.text)
+    elif isinstance(state, dict) and state.get("action") == "WAITING_FOR_BATCH_NAME":
+        job_data = state["data"]
+        job_data["batch_name"] = message.text
+        user_states[user_id] = None
+        try: await message.delete()
+        except: pass
+        await check_login_and_ask_folder(client, message, user_id, job_data)
+
+async def check_login_and_ask_folder(client, message, user_id, job_data):
+    cookies, key = load_cookies(user_id)
+    if not key: return await client.send_message(user_id, "❌ Please authenticate using `/login` first.")
+    
+    msg = await client.send_message(user_id, "🔎 *Retrieving cloud directories...*")
+    loop = asyncio.get_event_loop()
+    folders, root_id = await loop.run_in_executor(None, get_cloud_folders, cookies, key)
+    
+    if not root_id: return await msg.edit("❌ **Session Expired!** Please `/login` again.")
+
+    job_id = str(uuid.uuid4())[:8]
+    if user_id not in user_pending_jobs: user_pending_jobs[user_id] = {}
+    user_pending_jobs[user_id][job_id] = job_data
+
+    buttons = [[InlineKeyboardButton("🏠 ROOT Directory", callback_data=f"up_{root_id}_{job_id}")]]
+    row = []
+    for fname, fid in folders:
+        row.append(InlineKeyboardButton(f"📁 {fname}", callback_data=f"up_{fid}_{job_id}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row: buttons.append(row)
+            
+    await msg.edit(f"✅ Select a destination path for **{job_data['batch_name']}**:", reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex(r"^up_"))
+async def folder_selected(client, query):
+    user_id = query.from_user.id
+    if user_id not in allowed_users: return await query.answer("Unauthorized", show_alert=True)
+    
+    parts = query.data.split("_")
+    folder_id = int(parts[1])
+    job_id = parts[2]
+    
+    data = user_pending_jobs.get(user_id, {}).get(job_id)
+    if not data: return await query.answer("⚠️ Session expired.", show_alert=True)
+    user_pending_jobs[user_id].pop(job_id, None)
+    
+    batch_name = data.get("batch_name", "Uploads")
+    is_batch = data.get("is_batch", False)
+    extract_mode = data.get("extract", False)
+    
+    cookies, key = load_cookies(user_id)
+    loop = asyncio.get_event_loop()
+    
+    target_folder_id = folder_id
+    if is_batch and not extract_mode:
+        await query.message.edit_text(f"📁 *Creating remote folder '{batch_name}'...*")
+        target_folder_id = await loop.run_in_executor(None, create_cloud_folder, batch_name, folder_id, cookies, key)
+    elif extract_mode:
+        await query.message.edit_text(f"📁 *Creating remote folder '{batch_name}' for Extracted Files...*")
+        target_folder_id = await loop.run_in_executor(None, create_cloud_folder, batch_name + "_Extracted", folder_id, cookies, key)
+    
+    try: await query.message.delete()
+    except: pass
+    
+    tasks_list = data.get("links", [])
+    if not tasks_list: return await client.send_message(user_id, "❌ No valid payload mapped.")
+
+    status_msg = await client.send_message(user_id, "🔄 *Starting Tasks...*")
+    tracker = MultiProgressTracker(status_msg, len(tasks_list), is_batch)
+    
+    if user_id not in user_semaphores:
+        user_semaphores[user_id] = asyncio.Semaphore(bot_settings.get("owner_concurrent", 3))
+
+    async def process_item(idx, item):
+        task_id = f"t{job_id[:3]}{idx}" 
+        safe_filename = re.sub(r'[\\/*?:"<>|]', "", item["filename"])
+        local_path = os.path.abspath(os.path.join(os.getcwd(), f"temp_{task_id}_{safe_filename}"))
+
+        await tracker.update_status_only(task_id, "Queued")
+        
+        files_to_upload = []
+
+        try:
+            async with user_semaphores[user_id]:
+                # --- DOWNLOAD PHASE ---
+                url = item["url"]
+                await tracker.update_status_only(task_id, "Downloading Raw CDN Link")
+                await download_direct_link(url, local_path, task_id, tracker)
+                
+                # --- EXTRACT PHASE (IF REQUESTED) ---
+                if extract_mode and local_path.lower().endswith(('.zip', '.rar', '.tar', '.gz')):
+                    await tracker.update_status_only(task_id, "Extracting Archive...")
+                    extracted_list = await loop.run_in_executor(None, extract_archive, local_path)
+                    if extracted_list:
+                        files_to_upload = extracted_list
+                        if os.path.exists(local_path): os.remove(local_path)
+                    else:
+                        files_to_upload = [local_path] # Fallback if extract fails
+                else:
+                    files_to_upload = [local_path]
+
+                # --- UPLOAD PHASE ---
+                for f_path in files_to_upload:
+                    if not os.path.exists(f_path): continue
+                    
+                    up_filename = os.path.basename(f_path)
+                    fsize = os.path.getsize(f_path)
+                    mime = mimetypes.guess_type(f_path)[0] or 'application/octet-stream'
+                    
+                    # STRICT FOLDER ADHERENCE (Uploads strictly inside target_folder_id)
+                    metadata = {"name": up_filename, "size": str(fsize), "folderid": str(target_folder_id), "contenttype": mime, "modificationdate": datetime.now().strftime("%Y%m%dT%H%M%SZ")}
+                    
+                    session = requests.Session()
+                    adapter = HTTPAdapter(max_retries=Retry(total=5, backoff_factor=0.5))
+                    session.mount("https://", adapter)
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+
+                    class UploadMonitor:
+                        def __init__(self, t_id): self.t_id = t_id
+                        def callback(self, monitor_obj, file_size):
+                            asyncio.run_coroutine_threadsafe(tracker.update_ul(self.t_id, monitor_obj.bytes_read, file_size), loop)
+
+                    def upload_thread():
+                        with open(f_path, 'rb') as f:
+                            up_mon = UploadMonitor(task_id)
+                            m = MultipartEncoder(fields={'data': (None, json.dumps({"data": metadata}), 'application/json'), 'file': (up_filename, f, mime)})
+                            headers['Content-Type'] = monitor.content_type
+                            res = session.post(f"https://cloud.jazzdrive.com.pk/sapi/upload?action=save&acceptasynchronous=true&validationkey={key}", data=monitor, headers=headers, cookies=cookies, timeout=600)
+                            return res.status_code == 200
+
+                    success = await loop.run_in_executor(None, upload_thread)
+                    if not success:
+                        print(f"Failed to upload: {up_filename}")
+                
+                await tracker.update_status_only(task_id, "Completed")
+
+        except Exception as e:
+            print(e)
+            await tracker.update_status_only(task_id, "Failed")
+        finally:
+            if os.path.exists(local_path): 
+                try: os.remove(local_path)
+                except: pass
+            if extract_mode:
+                extract_dir = local_path + "_extracted"
+                if os.path.exists(extract_dir):
+                    try: shutil.rmtree(extract_dir)
+                    except: pass
+
+    if is_batch:
+        for idx, item in enumerate(tasks_list): await process_item(idx, item)
+    else:
+        await asyncio.gather(*(asyncio.create_task(process_item(idx, item)) for idx, item in enumerate(tasks_list)))
+    
+    await status_msg.edit(f"🏁 **Upload Completed!** All files safely uploaded to JazzDrive.")
+
+# --- SMART COOKIES ALIVE PING SYSTEM ---
+async def ping_sessions():
     while True:
-        print("\n  1: Link Download/Upload | 2: Batch Upload | 3: Login | c: Clear Cache | x: Exit")
-        ch = input("👉 Choice: ").strip()
-        if ch.lower() in ['x', 'exit']: break
-        elif ch.lower() == 'c': cache.clear_all()
-        elif ch == '3':
-            if os.path.exists(COOKIES_FILE): os.remove(COOKIES_FILE)
-            num = input("📱 Jazz number (03xxxxxxxxx): ").strip()
-            await jazz_login(num)
-        elif ch == '2':
-            existing = [os.path.join("downloads", f) for f in os.listdir("downloads") if f.endswith(('.mp4', '.mkv', '.webm', '.zip', '.rar'))]
-            if existing: await batch_upload(existing, input("📁 Folder: ").strip())
-        else:
-            urls = input("🔗 Link(s): ").split()
-            if urls: await pipeline(urls, "1080", input("📁 Folder: ").strip())
+        interval = bot_settings.get("ping_interval", 5)
+        await asyncio.sleep(interval * 60)
+        for uid in list(allowed_users):
+            cookies, key = load_cookies(uid)
+            if cookies and key:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, get_cloud_folders, cookies, key)
+                except Exception: pass
+
+# --- DUMMY WEB SERVER FOR CLOUD HOSTING ---
+async def health_check(request):
+    return web.Response(text="Bot is running perfectly!")
+
+async def start_web_server():
+    web_app = web.Application()
+    web_app.router.add_get('/', health_check)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# --- START BOT ---
+async def main():
+    print("🤖 PRO Bot starting...")
+    await app.start()
+    await start_web_server()
+    asyncio.create_task(ping_sessions())
+    print("✅ Bot is fully active!")
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
