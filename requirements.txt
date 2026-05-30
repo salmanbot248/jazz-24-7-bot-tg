@@ -1,6 +1,9 @@
-python-telegram-bot>=20.0
+python-telegram-bot==20.0
 requests
 requests-toolbelt
 aiohttp
 aiofiles
-
+gdown
+playwright
+nest-asyncio
+yt-dlp
