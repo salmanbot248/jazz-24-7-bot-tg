@@ -1,5 +1,9 @@
-import os, re, time, threading, queue, subprocess, requests, zipfile, telebot
+import os, re, time, json, threading, queue, subprocess, requests, zipfile, mimetypes, telebot
+from datetime import datetime
 from urllib.parse import urlparse
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from playwright.sync_api import sync_playwright
 
 BROWSER_ARGS = ["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--single-process"]
@@ -9,20 +13,22 @@ ZIP_EXTS   = [".zip", ".rar", ".7z", ".tar", ".gz"]
 MAX_SIZE_MB = 1990
 
 BOTS = [
-    {"token": "8552273158:AAERHvFbWO3eFrd2f1xBWGz3a5ILKE0DUUg", "chat_id": 7144917062, "state_file": "state1.json"},
+    {"token": "8350099407:AAEAX6NzIykESMj50CnduDAwngfHW1ER-oM", "chat_id": 7144917062, "state_file": "state1.json"},
 ]
 
 ALLOWED_USERS_FILE = "allowed_users.json"
 
+# ─── User helpers ─────────────────────────────────────────────
+
 def load_allowed(admin_id):
-    import json
     if not os.path.exists(ALLOWED_USERS_FILE):
         with open(ALLOWED_USERS_FILE, "w") as f: json.dump([admin_id], f)
     with open(ALLOWED_USERS_FILE) as f: return set(json.load(f))
 
 def save_allowed(s):
-    import json
     with open(ALLOWED_USERS_FILE, "w") as f: json.dump(list(s), f)
+
+# ─── General helpers ──────────────────────────────────────────
 
 def is_zip_url(link):
     return any(link.lower().endswith(ext) or ext in link.lower() for ext in ZIP_EXTS)
@@ -41,6 +47,12 @@ def file_ok(f, min_mb=0.5):
 
 def clean(f):
     if f and os.path.exists(f): os.remove(f)
+
+def fmt_bytes(n):
+    for unit in ["B","KB","MB","GB"]:
+        if n < 1024: return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 def get_referers(url):
     try:
@@ -61,6 +73,109 @@ def get_filename_from_url(url):
     except:
         return "video.mp4"
 
+def get_index_wait(size_bytes):
+    mb = size_bytes / (1024*1024)
+    if mb <= 20:   return 3
+    if mb <= 100:  return 12
+    if mb <= 500:  return 20
+    if mb <= 1200: return 30
+    return 40
+
+# ─── JazzDrive API helpers (from v5) ─────────────────────────
+
+def cookie_file(state_file):
+    return state_file  # state_file is already the cookie file
+
+def load_cookies(state_file):
+    if not os.path.exists(state_file): return None, None
+    try:
+        with open(state_file) as f: data = json.load(f)
+        raw = data.get("cookies", [])
+        cookies = {c["name"]: c["value"] for c in raw}
+        key = next((c["value"] for c in raw if c["name"] == "validationKey"), None)
+        return cookies, key
+    except: return None, None
+
+def api_get_folders(cookies, key):
+    try:
+        url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}"
+        r = requests.get(url, cookies=cookies, headers={"User-Agent": WEB_UA}, timeout=20)
+        folders_list = r.json().get("data", {}).get("folders", [])
+        root_id = next((f["id"] for f in folders_list if f.get("name") == "/"), None)
+        if not root_id: return [], None
+        subs = [(f["name"], f["id"]) for f in folders_list
+                if f.get("parentid") == root_id and f.get("name") != "/"]
+        return subs, root_id
+    except: return [], None
+
+def api_create_folder(name, parent_id, cookies, key):
+    try:
+        url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=save&validationkey={key}"
+        payload = {"data": {"magic": False, "offline": False, "name": name, "parentid": int(parent_id)}}
+        r = requests.post(url, cookies=cookies, json=payload, headers={"User-Agent": WEB_UA}, timeout=20)
+        d = r.json()
+        new_id = d.get("id") or d.get("data", {}).get("id")
+        return new_id if new_id else parent_id
+    except: return parent_id
+
+def api_generate_share_link(item_id, is_folder, cookies, key):
+    try:
+        sess = requests.Session()
+        sess.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.5)))
+        if is_folder:
+            url     = f"https://cloud.jazzdrive.com.pk/sapi/link/folder?action=save&validationkey={key}"
+            payload = {"data": {"folderid": int(item_id)}}
+        else:
+            url     = f"https://cloud.jazzdrive.com.pk/sapi/media/set?action=save&validationkey={key}"
+            payload = {"data": {"set": {"items": [int(item_id)]}}}
+        r = sess.post(url, cookies=cookies, json=payload, headers={"User-Agent": WEB_UA}, timeout=25)
+        d = r.json()
+        link = d.get("url") or d.get("data", {}).get("url")
+        if not link:
+            h = d.get("hash") or d.get("data", {}).get("hash")
+            if h: link = f"https://cloud.jazzdrive.com.pk/share/{'f/' if is_folder else ''}{h}"
+        return link
+    except: return None
+
+def api_upload_file(local_path, filename, folder_id, cookies, key, cancelled_flag=None):
+    """Upload file directly via JazzDrive REST API — no Playwright needed"""
+    fsize = os.path.getsize(local_path)
+    mime  = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+    meta  = {
+        "name": filename, "size": str(fsize),
+        "folderid": str(folder_id), "contenttype": mime,
+        "modificationdate": datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    }
+    sess = requests.Session()
+    sess.mount("https://", HTTPAdapter(max_retries=Retry(total=5, backoff_factor=0.5)))
+
+    def progress_cb(monitor):
+        if cancelled_flag and cancelled_flag():
+            raise Exception("Cancelled by user")
+
+    with open(local_path, "rb") as f:
+        m   = MultipartEncoder(fields={
+            "data": (None, json.dumps({"data": meta}), "application/json"),
+            "file": (filename, f, mime)
+        })
+        mon = MultipartEncoderMonitor(m, progress_cb)
+        r   = sess.post(
+            f"https://cloud.jazzdrive.com.pk/sapi/upload?action=save&acceptasynchronous=true&validationkey={key}",
+            data=mon,
+            headers={"User-Agent": WEB_UA, "Content-Type": mon.content_type},
+            cookies=cookies, timeout=600
+        )
+
+    if r.status_code == 200:
+        d   = r.json()
+        fid = d.get("data", {}).get("id") or d.get("id")
+        if not fid and isinstance(d.get("data"), list) and d["data"]:
+            fid = d["data"][0].get("id")
+        return True, fid
+    return False, None
+
+
+# ─── Bot Instance ─────────────────────────────────────────────
 
 class BotInstance:
     def __init__(self, token, chat_id, state_file):
@@ -81,12 +196,10 @@ class BotInstance:
             "pending_links": None, "pending_name": None,
         }
 
-    def msg(self, text, uid=None):
-        target = uid or self.chat_id
-        try:
-            self.bot.send_message(target, text)
+    def msg(self, text):
+        try: self.bot.send_message(self.chat_id, text)
         except:
-            try: self.bot.send_message(target, re.sub(r'[*_`\[\]]', '', text))
+            try: self.bot.send_message(self.chat_id, re.sub(r'[*_`\[\]]', '', text))
             except: pass
 
     def send_photo(self, path, caption=""):
@@ -102,13 +215,24 @@ class BotInstance:
         except: pass
 
     def next_task_id(self):
-        import uuid
-        return str(uuid.uuid4())[:8]
+        import uuid; return str(uuid.uuid4())[:8]
 
     def is_cancelled(self, task_id):
         return task_id and (task_id in self.cancelled or f"all_{self.chat_id}" in self.cancelled)
 
-    # LOGIN
+    # ─── Session keep-alive ping ──────────────────────────────
+
+    def session_ping_loop(self):
+        while True:
+            time.sleep(5 * 60)
+            cookies, key = load_cookies(self.state_file)
+            if not cookies or not key: continue
+            try:
+                api_get_folders(cookies, key)  # lightweight API call
+            except: pass
+
+    # ─── LOGIN (Playwright — only for login) ─────────────────
+
     def do_login(self, page, context):
         self.msg("LOGIN REQUIRED\n\nJazz number bhejein\nFormat: 03XXXXXXXXX")
         self.ctx["state"] = "WAITING_FOR_NUMBER"
@@ -117,6 +241,7 @@ class BotInstance:
             time.sleep(1)
         else:
             self.msg("Timeout! Task cancel."); return False
+
         page.locator("#msisdn").fill(self.ctx["number"])
         time.sleep(1)
         page.locator("#signinbtn").first.click()
@@ -129,6 +254,7 @@ class BotInstance:
             time.sleep(1)
         else:
             self.msg("Timeout! Task cancel."); return False
+
         for i, digit in enumerate(self.ctx["otp"].strip()[:6], 1):
             try:
                 f = page.locator(f"//input[@aria-label='Digit {i}']")
@@ -158,12 +284,11 @@ class BotInstance:
                     self.do_login(page, ctx)
                 else:
                     self.msg("LOGIN VALID!\nLink bhejein!")
-            except Exception as e:
-                self.msg(f"Error: {str(e)[:150]}")
-            finally:
-                browser.close()
+            except Exception as e: self.msg(f"Error: {str(e)[:150]}")
+            finally: browser.close()
 
-    # DOWNLOAD
+    # ─── Download ─────────────────────────────────────────────
+
     def download_file(self, url, out_path, task_id=None):
         last_error = "Unknown"
         clean(out_path)
@@ -172,12 +297,12 @@ class BotInstance:
         if is_m3u8(url):
             if not out_path.endswith('.mp4'):
                 out_path = out_path.rsplit('.', 1)[0] + '.mp4'
-            for referer in referers[:2]:
+            for ref in referers[:2]:
                 if self.is_cancelled(task_id): return None, "Cancelled"
                 clean(out_path)
                 try:
                     cmd = ["ffmpeg", "-y"]
-                    if referer: cmd += ["-headers", f"Referer: {referer}\r\nUser-Agent: {WEB_UA}\r\n"]
+                    if ref: cmd += ["-headers", f"Referer: {ref}\r\nUser-Agent: {WEB_UA}\r\n"]
                     else: cmd += ["-user_agent", WEB_UA]
                     cmd += ["-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", out_path]
                     subprocess.run(cmd, capture_output=True, timeout=600)
@@ -187,23 +312,22 @@ class BotInstance:
 
         try:
             import yt_dlp
-            tmp_template = out_path.rsplit('.', 1)[0] + '.%(ext)s'
-            ydl_opts = {
-                "outtmpl": tmp_template, "quiet": True, "no_warnings": True,
+            tmp = out_path.rsplit('.', 1)[0] + '.%(ext)s'
+            opts = {
+                "outtmpl": tmp, "quiet": True, "no_warnings": True,
                 "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                 "merge_output_format": "mp4",
-                "http_headers": {"User-Agent": WEB_UA, "Referer": referers[0], "Origin": referers[0].rstrip("/")},
+                "http_headers": {"User-Agent": WEB_UA, "Referer": referers[0]},
                 "socket_timeout": 30,
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
+            with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([url])
             base = out_path.rsplit('.', 1)[0]
             for ext in VIDEO_EXTS:
-                candidate = base + ext
-                if file_ok(candidate, min_mb=0.1): return candidate, "Success"
+                if file_ok(base + ext, min_mb=0.1): return base + ext, "Success"
             if file_ok(out_path, min_mb=0.1): return out_path, "Success"
         except Exception as e: last_error = f"yt-dlp: {str(e)[:100]}"
 
-        for referer in referers:
+        for ref in referers:
             if self.is_cancelled(task_id): return None, "Cancelled"
             clean(out_path)
             try:
@@ -212,43 +336,31 @@ class BotInstance:
                        f"--user-agent={WEB_UA}",
                        "-d", os.path.dirname(out_path) or "/tmp",
                        "-o", os.path.basename(out_path)]
-                if referer: cmd += [f"--referer={referer}", f"--header=Origin: {referer.rstrip('/')}"]
+                if ref: cmd += [f"--referer={ref}", f"--header=Origin: {ref.rstrip('/')}"]
                 cmd.append(url)
-                result = subprocess.run(cmd, capture_output=True, timeout=600)
+                r = subprocess.run(cmd, capture_output=True, timeout=600)
                 if file_ok(out_path, min_mb=0.1): return out_path, "Success"
-                last_error = "aria2c: " + result.stderr.decode()[:100]
+                last_error = "aria2c: " + r.stderr.decode()[:100]
             except Exception as e: last_error = f"aria2c: {str(e)[:100]}"
 
-        for referer in referers:
+        for ref in referers:
             if self.is_cancelled(task_id): return None, "Cancelled"
             clean(out_path)
             try:
                 cmd = ["curl", "-L", "-k", "--retry", "3", "--retry-delay", "3",
                        "--connect-timeout", "30", "-H", f"User-Agent: {WEB_UA}", "-o", out_path]
-                if referer: cmd += ["-H", f"Referer: {referer}", "-H", f"Origin: {referer.rstrip('/')}"]
+                if ref: cmd += ["-H", f"Referer: {ref}", "-H", f"Origin: {ref.rstrip('/')}"]
                 cmd.append(url)
                 subprocess.run(cmd, timeout=600)
                 if file_ok(out_path, min_mb=0.1): return out_path, "Success"
             except Exception as e: last_error = f"curl: {str(e)[:100]}"
 
-        for referer in referers[:2]:
-            if self.is_cancelled(task_id): return None, "Cancelled"
-            clean(out_path)
-            try:
-                cmd = ["wget", "-q", "--tries=3", "--timeout=120",
-                       f"--user-agent={WEB_UA}", "-O", out_path]
-                if referer: cmd += [f"--referer={referer}"]
-                cmd.append(url)
-                subprocess.run(cmd, timeout=600)
-                if file_ok(out_path, min_mb=0.1): return out_path, "Success"
-            except Exception as e: last_error = f"wget: {str(e)[:100]}"
-
-        for referer in referers:
+        for ref in referers:
             if self.is_cancelled(task_id): return None, "Cancelled"
             clean(out_path)
             try:
                 hdrs = {"User-Agent": WEB_UA}
-                if referer: hdrs["Referer"] = referer; hdrs["Origin"] = referer.rstrip("/")
+                if ref: hdrs["Referer"] = ref; hdrs["Origin"] = ref.rstrip("/")
                 with requests.get(url, headers=hdrs, stream=True, timeout=60) as r:
                     r.raise_for_status()
                     with open(out_path, "wb") as f:
@@ -259,177 +371,157 @@ class BotInstance:
 
         return None, last_error
 
-    # SPLIT
+    # ─── Cobalt YouTube ───────────────────────────────────────
+
+    def youtube_to_direct(self, url):
+        for quality in ["1080", "720", "480"]:
+            try:
+                r = requests.post(
+                    "https://api.cobalt.tools/",
+                    json={"url": url, "videoQuality": quality},
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    timeout=30
+                )
+                d = r.json()
+                if d.get("status") in ("redirect", "stream", "tunnel", "picker"):
+                    link = d.get("url")
+                    if link: return link, quality
+            except: continue
+        return None, None
+
+    # ─── Split ────────────────────────────────────────────────
+
     def split_video(self, filepath):
         size_mb = os.path.getsize(filepath) / (1024*1024)
         if size_mb <= MAX_SIZE_MB: return [filepath]
-        self.msg(f"File {size_mb:.0f}MB splitting...")
+        self.msg(f"File {size_mb:.0f}MB — splitting...")
         base = filepath.rsplit(".", 1)[0]; ext = filepath.rsplit(".", 1)[-1]
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", filepath],
             capture_output=True, text=True)
-        try: total_duration = float(result.stdout.strip())
+        try: total = float(result.stdout.strip())
         except: return [filepath]
-        num_parts = int(size_mb / MAX_SIZE_MB) + 1
-        part_duration = total_duration / num_parts
+        n = int(size_mb / MAX_SIZE_MB) + 1
+        dur = total / n
         parts = []
-        for i in range(num_parts):
-            part_path = f"{base}_part{i+1}.{ext}"
+        for i in range(n):
+            pp = f"{base}_part{i+1}.{ext}"
             subprocess.run(["ffmpeg", "-y", "-i", filepath,
-                "-ss", str(i * part_duration), "-t", str(part_duration),
-                "-c", "copy", part_path], capture_output=True, timeout=3600)
-            if os.path.exists(part_path) and os.path.getsize(part_path) > 1024:
-                parts.append(part_path)
+                "-ss", str(i*dur), "-t", str(dur), "-c", "copy", pp],
+                capture_output=True, timeout=3600)
+            if os.path.exists(pp) and os.path.getsize(pp) > 1024: parts.append(pp)
         if parts: clean(filepath)
         return parts if parts else [filepath]
 
-    # SHARE LINK
-    def get_share_link(self, page, filename):
-        share_link = None
+    # ─── Upload via API (no Playwright) ──────────────────────
+
+    def upload_file_api(self, local_path, filename, folder_id, task_id=None):
+        cookies, key = load_cookies(self.state_file)
+        if not cookies or not key:
+            self.msg("Session nahi hai — /checklogin karo"); return None
+
+        fname = safe_filename(filename) or os.path.basename(local_path)
+        fsize = os.path.getsize(local_path)
+        self.msg(f"Uploading {fname[:50]}...\n{fmt_bytes(fsize)}")
+
         try:
-            self.msg("Share link nikal raha hoon...")
-            page.reload(wait_until="networkidle")
-            time.sleep(5)
-            short_name = os.path.basename(filename)[:25]
-            file_element = page.get_by_text(short_name).first
-            if file_element.is_visible():
-                file_element.click(button="right")
-                time.sleep(2)
-                share_btn = None
-                for selector in ["text=Share", '[data-testid="ShareIcon"]',
-                                  "button:has-text('Share')", "li:has-text('Share')"]:
-                    try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible(timeout=2000): share_btn = btn; break
-                    except: pass
-                if share_btn:
-                    share_btn.click()
-                    time.sleep(3)
-                    for input_sel in ['input[name="get-link-url"]', 'input[readonly]', 'input[type="text"]']:
-                        try:
-                            inp = page.locator(input_sel).first
-                            if inp.is_visible(timeout=2000):
-                                val = inp.get_attribute("value")
-                                if val and val.startswith("http"): share_link = val; break
-                        except: pass
-                    page.keyboard.press("Escape")
-                    time.sleep(1)
-        except Exception as e: self.msg(f"Share link error: {str(e)[:100]}")
-        return share_link
-
-    # UPLOAD
-    def jazz_drive_upload(self, filename, folder_name=""):
-        share_link = None
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
-            ctx = browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                storage_state=self.state_file if os.path.exists(self.state_file) else None
+            success, file_id = api_upload_file(
+                local_path, fname, folder_id, cookies, key,
+                cancelled_flag=lambda: self.is_cancelled(task_id)
             )
-            page = ctx.new_page()
-            try:
-                page.goto("https://cloud.jazzdrive.com.pk/#folders", wait_until="networkidle", timeout=90000)
-                time.sleep(5)
-                if page.locator("#msisdn").is_visible():
-                    self.msg("Session expire! Login karo...")
-                    ok = self.do_login(page, ctx)
-                    if not ok: self.msg("Login fail."); return None
-                    page.goto("https://cloud.jazzdrive.com.pk/#folders", wait_until="networkidle", timeout=90000)
-                    time.sleep(5)
+        except Exception as e:
+            self.msg(f"Upload error: {str(e)[:150]}"); return None
 
-                # FOLDER SELECTION
-                if folder_name and folder_name.strip().upper() not in ("ROOT", ""):
-                    try:
-                        page.get_by_text(folder_name.strip(), exact=False).first.click(timeout=5000)
-                        time.sleep(3)
-                        self.msg(f"Folder: {folder_name}")
-                    except:
-                        self.msg(f"Folder '{folder_name}' nahi mila — root mein upload")
+        if not success or not file_id:
+            self.msg("Upload fail!"); return None
 
-                ctx.storage_state(path=self.state_file)
-                abs_path = os.path.abspath(filename)
-                for sel in ["xpath=/html/body/div/div/div[1]/div/header/div/div/button", "button:has-text('Upload')"]:
-                    try: page.click(sel, timeout=5000); break
-                    except: pass
-                page.wait_for_selector("input[type='file']", state="attached")
-                with page.expect_file_chooser() as fc_info:
-                    page.click("xpath=/html/body/div[2]/div[3]/div/div/form/div/div/div/div[1]")
-                fc_info.value.set_files(abs_path)
-                time.sleep(3)
-                try:
-                    yes_btn = page.get_by_text("Yes", exact=True)
-                    if yes_btn.is_visible(): yes_btn.click()
-                except: pass
-                sz = os.path.getsize(filename) / (1024*1024)
-                wait_sec = max(60, int(sz * 4))
-                self.msg(f"Uploading {os.path.basename(filename)[:50]}... (~{wait_sec}s)")
-                elapsed = 0; upload_done = False
-                while elapsed < wait_sec:
-                    time.sleep(30); elapsed += 30
-                    try:
-                        if page.locator("text=Uploads completed").is_visible():
-                            self.msg(f"Upload complete! ({elapsed}s)")
-                            upload_done = True; break
-                    except: pass
-                    if elapsed % 60 == 0: self.take_screenshot(page, f"Progress {elapsed}s/{wait_sec}s")
-                if not upload_done: self.take_screenshot(page, f"Final check {elapsed}s")
+        # Wait for indexing
+        wait = get_index_wait(fsize)
+        self.msg(f"Indexing... ({wait}s)")
+        time.sleep(wait)
 
-                # SHARE LINK
-                share_link = self.get_share_link(page, filename)
-                ctx.storage_state(path=self.state_file)
-            except Exception as e: self.msg(f"Upload error: {str(e)[:200]}")
-            finally: browser.close()
-        return share_link
+        # Generate share link
+        link = api_generate_share_link(file_id, False, cookies, key)
+        return link
 
-    def upload_with_split(self, filepath, folder_name="", task_id=None):
+    def upload_with_split(self, filepath, folder_id, task_id=None):
         if self.is_cancelled(task_id): return []
         parts = self.split_video(filepath)
         links = []
         for i, part in enumerate(parts, 1):
             if self.is_cancelled(task_id): clean(part); break
             if len(parts) > 1: self.msg(f"Part {i}/{len(parts)} upload...")
-            link = self.jazz_drive_upload(part, folder_name)
+            fname = os.path.basename(part)
+            link = self.upload_file_api(part, fname, folder_id, task_id)
             if link: links.append(link)
             clean(part)
         return links
 
-    # PROCESSORS
+    def get_folder_id(self, folder_name):
+        """folder_name se ID dhundo — nahi mila to root ID lo"""
+        cookies, key = load_cookies(self.state_file)
+        if not cookies or not key: return None, None
+        folders, root_id = api_get_folders(cookies, key)
+        if not root_id: return None, None
+        if not folder_name or folder_name.upper() == "ROOT":
+            return root_id, cookies, key
+        # Case-insensitive match
+        for name, fid in folders:
+            if name.strip().lower() == folder_name.strip().lower():
+                return fid, cookies, key
+        # Nahi mila — root mein upload
+        self.msg(f"Folder '{folder_name}' nahi mila — root mein upload")
+        return root_id, cookies, key
+
+    # ─── Processors ───────────────────────────────────────────
+
     def process_direct(self, url, filename, folder_name="", task_id=None):
-        # YouTube detect — Cobalt se direct link lo
+        # YouTube
         if any(x in url for x in ["youtube.com/watch", "youtu.be/", "youtube.com/shorts"]):
-            self.msg("YouTube link detect hua!\nCobalt se direct link nikal raha hoon...")
+            self.msg("YouTube link!\nCobalt se direct link nikal raha hoon...")
             direct, quality = self.youtube_to_direct(url)
             if direct:
                 self.msg(f"Direct link mila! ({quality}p)\nDownloading...")
-                url = direct
-                filename = filename or "video.mp4"
+                url = direct; filename = filename or "video.mp4"
             else:
                 self.msg("Cobalt fail — yt-dlp try karega...")
-        fname = filename or get_filename_from_url(url)
+
+        fname    = filename or get_filename_from_url(url)
         out_path = f"/tmp/{safe_filename(fname)}"
         clean(out_path)
         self.msg(f"Downloading...\n{fname[:60]}")
-        result, error_msg = self.download_file(url, out_path, task_id)
-        if not result: self.msg(f"Download fail!\n{error_msg[:200]}"); return
+
+        result, err = self.download_file(url, out_path, task_id)
+        if not result: self.msg(f"Download fail!\n{err[:200]}"); return
+
         sz = os.path.getsize(result) / (1024*1024)
-        self.msg(f"Downloaded! {sz:.1f} MB\nUploading...")
-        links = self.upload_with_split(result, folder_name, task_id)
+        self.msg(f"Downloaded! {sz:.1f} MB")
+
+        result_folder = self.get_folder_id(folder_name)
+        folder_id = result_folder[0] if result_folder else None
+        if not folder_id: self.msg("Session problem — /checklogin karo"); clean(out_path); return
+
+        links = self.upload_with_split(result, folder_id, task_id)
         if links: self.msg(f"Upload Done!\n\nShare Link:\n{links[0]}")
         else: self.msg("Upload Done!\n(Share link nahi mila)")
 
     def process_zip(self, url, folder_name="", task_id=None):
         import shutil
-        zip_path = f"/tmp/series_{self.chat_id}.zip"
+        zip_path    = f"/tmp/series_{self.chat_id}.zip"
         extract_dir = f"/tmp/series_{self.chat_id}_extracted"
         clean(zip_path)
         if os.path.exists(extract_dir): shutil.rmtree(extract_dir)
         os.makedirs(extract_dir, exist_ok=True)
+
         self.msg("ZIP/Season download ho raha hai...")
-        result, error_msg = self.download_file(url, zip_path, task_id)
-        if not result or not file_ok(zip_path): self.msg(f"ZIP fail!\n{error_msg[:200]}"); return
+        result, err = self.download_file(url, zip_path, task_id)
+        if not result or not file_ok(zip_path):
+            self.msg(f"ZIP fail!\n{err[:200]}"); return
+
         sz = os.path.getsize(zip_path) / (1024*1024)
         self.msg(f"Downloaded! {sz:.1f} MB\nExtracting...")
+
         try:
             if zipfile.is_zipfile(zip_path):
                 with zipfile.ZipFile(zip_path, "r") as zf: zf.extractall(extract_dir)
@@ -438,30 +530,54 @@ class BotInstance:
             try: subprocess.run(["7z", "x", zip_path, f"-o{extract_dir}", "-y"], timeout=120)
             except: self.msg(f"Extract fail: {str(e)[:100]}"); return
         clean(zip_path)
+
         video_files = []
         for root, dirs, files in os.walk(extract_dir):
             for f in sorted(files):
                 if is_video_file(f): video_files.append(os.path.join(root, f))
+
         if not video_files: self.msg("ZIP mein koi video nahi mili!"); return
-        self.msg(f"Total {len(video_files)} Episodes mili!\nUpload shuru...")
+        self.msg(f"Total {len(video_files)} Episodes!\nUpload shuru...")
+
+        # Get/create folder
+        cookies, key = load_cookies(self.state_file)
+        if not cookies or not key: self.msg("Session problem!"); return
+        folders, root_id = api_get_folders(cookies, key)
+        if not root_id: self.msg("Folder list fail!"); return
+
+        if folder_name and folder_name.upper() != "ROOT":
+            match = next((fid for name, fid in folders if name.lower() == folder_name.lower()), None)
+            target_id = match if match else api_create_folder(folder_name, root_id, cookies, key)
+            if not match: self.msg(f"Folder '{folder_name}' nahi mila — create kiya")
+        else:
+            target_id = root_id
+
         all_links = []
-        for i, video_path in enumerate(video_files, 1):
-            if self.is_cancelled(task_id): self.msg("Season upload cancelled!"); break
-            fname = os.path.basename(video_path)
-            fsize = os.path.getsize(video_path) / (1024*1024)
+        for i, vp in enumerate(video_files, 1):
+            if self.is_cancelled(task_id): self.msg("Season cancelled!"); break
+            fname = os.path.basename(vp)
+            fsize = os.path.getsize(vp) / (1024*1024)
             self.msg(f"Episode {i}/{len(video_files)}\n{fname}\n{fsize:.1f} MB")
-            links = self.upload_with_split(video_path, folder_name, task_id)
+            links = self.upload_with_split(vp, target_id, task_id)
             if links: all_links.append(f"Ep {i}: {links[0]}"); self.msg(f"Ep {i} Done!\n{links[0]}")
             else: all_links.append(f"Ep {i}: Uploaded (No Link)"); self.msg(f"Ep {i} Done!")
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        self.msg(f"SEASON COMPLETE!\nTotal {len(all_links)} episodes.\n\n" + "\n".join(all_links))
 
-    # WORKER
+        shutil.rmtree(extract_dir, ignore_errors=True)
+
+        # Folder share link
+        folder_link = api_generate_share_link(target_id, True, cookies, key)
+        report = f"SEASON COMPLETE!\nTotal {len(all_links)} episodes.\n\n"
+        report += "\n".join(all_links)
+        if folder_link: report += f"\n\nFolder Link:\n{folder_link}"
+        self.msg(report)
+
+    # ─── Worker ───────────────────────────────────────────────
+
     def worker_loop(self):
         try:
             while not self.task_queue.empty():
                 while self.queue_paused: time.sleep(5)
-                item = self.task_queue.get()
+                item    = self.task_queue.get()
                 task_id = item.get("task_id")
                 if self.is_cancelled(task_id): self.task_queue.task_done(); continue
                 self.msg(f"PROCESSING...\n{item.get('link','')[:80]}")
@@ -483,7 +599,8 @@ class BotInstance:
                 self.is_working = True
                 threading.Thread(target=self.worker_loop, daemon=True).start()
 
-    # HANDLERS
+    # ─── Handlers ─────────────────────────────────────────────
+
     def register_handlers(self):
         bot = self.bot
 
@@ -541,7 +658,7 @@ class BotInstance:
                         links.append({"url": p[0].strip(), "filename": f"{p[1].strip()}{p[2].strip()}"})
                     except: pass
             if not links:
-                bot.reply_to(m, "Format (ek line mein ek link):\nurl - Name - .ext"); return
+                bot.reply_to(m, "Format (ek line mein ek):\nurl - Name - .ext"); return
             self.ctx["pending_links"] = links
             self.ctx["pending_type"]  = "mlink"
             self.ctx["state"]         = "WAITING_FOR_FOLDER"
@@ -599,12 +716,14 @@ class BotInstance:
         @bot.message_handler(commands=["status"])
         def cmd_status(m):
             if m.chat.id not in self.allowed: return
+            cookies, key = load_cookies(self.state_file)
+            session_ok = "Active" if cookies and key else "None"
             self.msg(
                 f"BOT STATUS\n\n"
                 f"State: {'Working' if self.is_working else 'Idle'}\n"
                 f"Queue: {self.task_queue.qsize()}\n"
                 f"Paused: {'YES' if self.queue_paused else 'No'}\n"
-                f"Session: {'Active' if os.path.exists(self.state_file) else 'None'}"
+                f"Session: {session_ok}"
             )
 
         @bot.message_handler(commands=["pause"])
@@ -633,8 +752,7 @@ class BotInstance:
             parts = m.text.split()
             if len(parts) < 2: bot.reply_to(m, "Format: /allow user_id"); return
             try:
-                uid = int(parts[1])
-                self.allowed.add(uid); save_allowed(self.allowed)
+                uid = int(parts[1]); self.allowed.add(uid); save_allowed(self.allowed)
                 bot.reply_to(m, f"User {uid} authorized.")
             except: bot.reply_to(m, "Invalid user_id")
 
@@ -685,10 +803,8 @@ class BotInstance:
                 else:
                     tid = self.next_task_id()
                     self.task_queue.put({
-                        "link": self.ctx["pending_link"],
-                        "type": self.ctx["pending_type"],
-                        "filename": self.ctx.get("pending_name", ""),
-                        "folder": folder, "task_id": tid
+                        "link": self.ctx["pending_link"], "type": self.ctx["pending_type"],
+                        "filename": self.ctx.get("pending_name", ""), "folder": folder, "task_id": tid
                     })
                     bot.reply_to(m, f"Task added!\nFolder: {folder or 'Root'}\nTask ID: {tid}\nQueue: {self.task_queue.qsize()}")
                     self.ctx.update({"pending_link": None, "pending_type": None, "pending_name": None, "state": "IDLE"})
@@ -698,70 +814,20 @@ class BotInstance:
                 if is_zip_url(text): ltype = "zip"; hint = "ZIP/Season link mila!"
                 elif is_m3u8(text): ltype = "direct"; hint = "M3U8/HLS link mila!"
                 else: ltype = "direct"; hint = "Direct link mila!"
-                self.ctx["pending_link"] = text
-                self.ctx["pending_type"] = ltype
-                self.ctx["pending_name"] = get_filename_from_url(text)
-                self.ctx["state"]        = "WAITING_FOR_FOLDER"
+                self.ctx.update({"pending_link": text, "pending_type": ltype,
+                                 "pending_name": get_filename_from_url(text), "state": "WAITING_FOR_FOLDER"})
                 bot.reply_to(m, f"{hint}\n\nFolder name bhejein\n(ya 'root')")
             else:
                 bot.reply_to(m, "Link bhejein ya /start dekho")
 
-    # SESSION KEEP-ALIVE — har 5 minute mein ping
-    def session_ping_loop(self):
-        while True:
-            time.sleep(5 * 60)  # 5 minute wait
-            if not os.path.exists(self.state_file):
-                continue
-            try:
-                import json
-                with open(self.state_file) as f:
-                    state = json.load(f)
-                cookies = {c["name"]: c["value"] for c in state.get("cookies", [])}
-                key = cookies.get("validationKey") or cookies.get("validationkey")
-                if not key:
-                    continue
-                # JazzDrive API ko silent ping
-                r = requests.get(
-                    f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}",
-                    cookies=cookies,
-                    headers={"User-Agent": WEB_UA},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    pass  # session alive
-                else:
-                    self.msg("Session ping fail — /checklogin karo")
-            except Exception as e:
-                pass  # silently fail, next ping pe try hoga
-
-    # COBALT YouTube direct link
-    def youtube_to_direct(self, url):
-        for quality in ["1080", "720", "480"]:
-            try:
-                r = requests.post(
-                    "https://api.cobalt.tools/",
-                    json={"url": url, "videoQuality": quality},
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/json"
-                    },
-                    timeout=30
-                )
-                data = r.json()
-                if data.get("status") in ("redirect", "stream", "tunnel", "picker"):
-                    link = data.get("url")
-                    if link: return link, quality
-            except Exception as e:
-                continue
-        return None, None
-
     def run(self):
         self.register_handlers()
-        # Session keep-alive thread start karo
         threading.Thread(target=self.session_ping_loop, daemon=True).start()
         self.msg("BOT ONLINE!\n\nDirect / M3U8 / ZIP / YouTube link bhejein\n/start dekho commands ke liye")
         self.bot.infinity_polling()
 
+
+# ─── Main ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     instances = []; threads = []
