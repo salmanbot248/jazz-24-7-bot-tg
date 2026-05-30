@@ -1,7 +1,5 @@
 #!/bin/bash
-echo "Installing requirements..."
 pip install -r requirements.txt
-
-echo "Starting JazzDrive Bot v6..."
+playwright install chromium
+playwright install-deps chromium
 python bot.py
-
