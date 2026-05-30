@@ -1,596 +1,773 @@
-import os
-import json
-import time
-import asyncio
-import random
-import re
-import mimetypes
-import uuid
-import shutil
-from datetime import datetime
-from urllib.parse import urlparse, parse_qs, urljoin
+import os, re, time, threading, queue, subprocess, requests, zipfile, telebot
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright
 
-from pyrogram import Client, filters, idle
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import requests
-from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import nest_asyncio
-import aiohttp
-from aiohttp import web
-import aiofiles
-import gdown
+BROWSER_ARGS = ["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--single-process"]
+WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+VIDEO_EXTS = [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"]
+ZIP_EXTS   = [".zip", ".rar", ".7z", ".tar", ".gz"]
+MAX_SIZE_MB = 1990
 
-nest_asyncio.apply()
+BOTS = [
+    {"token": "8350099407:AAEAX6NzIykESMj50CnduDAwngfHW1ER-oM", "chat_id": 7144917062, "state_file": "state1.json"},
+]
 
-# --- TELEGRAM BOT CREDENTIALS ---
-API_ID = os.environ.get("API_ID", "YOUR_API_ID_HERE")
-API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH_HERE")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-
-if not all([API_ID, API_HASH, BOT_TOKEN]):
-    print("❌ ERROR: API_ID, API_HASH, or BOT_TOKEN secrets are not set!")
-    exit(1)
-
-app = Client("jazz_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --- ADMIN & MULTI-USER SYSTEM ---
-ADMIN_ID = 7128257853
 ALLOWED_USERS_FILE = "allowed_users.json"
-SETTINGS_FILE = "bot_settings.json"
 
-user_states = {}
-user_pending_jobs = {} 
-active_tasks = {} 
-login_events = {}
-cancelled_tasks = set()
-user_active_tasks = {} 
-
-user_semaphores = {}
-user_queue_counts = {}
-
-def load_allowed_users():
+def load_allowed(admin_id):
+    import json
     if not os.path.exists(ALLOWED_USERS_FILE):
-        with open(ALLOWED_USERS_FILE, "w") as f:
-            json.dump([ADMIN_ID], f)
-    with open(ALLOWED_USERS_FILE, "r") as f:
-        return set(json.load(f))
+        with open(ALLOWED_USERS_FILE, "w") as f: json.dump([admin_id], f)
+    with open(ALLOWED_USERS_FILE) as f: return set(json.load(f))
 
-def load_settings():
-    if not os.path.exists(SETTINGS_FILE):
-        default_settings = {"owner_concurrent": 3, "user_concurrent": 3, "ping_interval": 5}
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(default_settings, f)
-        return default_settings
-    with open(SETTINGS_FILE, "r") as f:
-        data = json.load(f)
-        if "owner_concurrent" not in data: data["owner_concurrent"] = data.get("max_concurrent", 3)
-        return data
+def save_allowed(s):
+    import json
+    with open(ALLOWED_USERS_FILE, "w") as f: json.dump(list(s), f)
 
-allowed_users = load_allowed_users()
-bot_settings = load_settings()
+def is_zip_url(link):
+    return any(link.lower().endswith(ext) or ext in link.lower() for ext in ZIP_EXTS)
 
-# --- HELPER FUNCTIONS ---
-def get_cookie_file(user_id):
-    return f"jazz_cookies_{user_id}.json"
+def is_video_file(f):
+    return any(f.lower().endswith(ext) for ext in VIDEO_EXTS)
 
-def load_cookies(user_id):
-    cookie_file = get_cookie_file(user_id)
-    if not os.path.exists(cookie_file): return None, None
+def is_m3u8(url):
+    return '.m3u8' in url.lower()
+
+def safe_filename(t):
+    return re.sub(r'[\\/*?:"<>|]', '', t).strip().replace(' ', '_')[:80]
+
+def file_ok(f, min_mb=0.5):
+    return os.path.exists(f) and os.path.getsize(f) / (1024*1024) >= min_mb
+
+def clean(f):
+    if f and os.path.exists(f): os.remove(f)
+
+def get_referers(url):
     try:
-        with open(cookie_file, 'r') as f:
-            data = json.load(f)
-        raw_cookies = data.get('cookies', [])
-        cookies = {c['name']: c['value'] for c in raw_cookies}
-        key = next((c['value'] for c in raw_cookies if c['name'] == 'validationKey'), None)
-        return cookies, key
-    except Exception: return None, None
+        parsed = urlparse(url)
+        dr = f"{parsed.scheme}://{parsed.netloc}/"
+    except:
+        dr = "https://www.google.com/"
+    return [dr, "https://www.google.com/", "https://www.facebook.com/", ""]
 
-def get_cloud_folders(cookies, key):
-    session = requests.Session()
-    url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}"
+def get_filename_from_url(url):
     try:
-        res = session.get(url, cookies=cookies, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
-        data = res.json()
-        folders_list = data.get('data', {}).get('folders', [])
-        root_id = None
-        for f in folders_list:
-            if f.get('name') == '/':
-                root_id = f.get('id')
-                break
-        if not root_id: return [], None
-        sub_folders = [(f['name'], f['id']) for f in folders_list if f.get('parentid') == root_id and f.get('name') != '/']
-        return sub_folders, root_id
-    except Exception: return [], None
+        path = urlparse(url).path
+        name = path.split("/")[-1].split("?")[0]
+        name = requests.utils.unquote(name)
+        name = safe_filename(name)
+        if "." not in name or len(name) < 3: name = "video.mp4"
+        return name
+    except:
+        return "video.mp4"
 
-def create_cloud_folder(name, parent_id, cookies, key):
-    session = requests.Session()
-    url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=save&validationkey={key}"
-    payload = {"data": {"magic": False, "offline": False, "name": name, "parentid": int(parent_id)}}
-    try:
-        res = session.post(url, cookies=cookies, json=payload, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
-        d = res.json()
-        new_id = d.get('id') or d.get('data', {}).get('id')
-        return new_id if new_id else parent_id
-    except Exception: return parent_id
 
-def format_bytes(size):
-    if size <= 0: return "0 B"
-    size = float(size)
-    power = 2**10
-    n = 0
-    power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
-    while size >= power and n < 4:
-        size /= power
-        n += 1
-    return f"{round(size, 2)} {power_labels[n]}"
-
-class MultiProgressTracker:
-    def __init__(self, message, total_files, is_batch=False):
-        self.message = message
-        self.total_files = total_files
-        self.is_batch = is_batch
-        self.tasks = {}
-        self.last_update_time = time.time()
-        self.file_counter = 1
-
-    def init_task(self, task_id, filename):
-        self.tasks[task_id] = {
-            "index": self.file_counter, "name": filename, "action": "Queued", 
-            "size": 0, "dl_current": 0, "dl_speed": 0, "dl_start": 0,
-            "ul_current": 0, "ul_speed": 0, "ul_start": 0
+class BotInstance:
+    def __init__(self, token, chat_id, state_file):
+        self.token        = token
+        self.chat_id      = chat_id
+        self.state_file   = state_file
+        self.bot          = telebot.TeleBot(token)
+        self.task_queue   = queue.Queue()
+        self.is_working   = False
+        self.worker_lock  = threading.Lock()
+        self.queue_paused = False
+        self.cancelled    = set()
+        self.allowed      = load_allowed(chat_id)
+        self.ctx = {
+            "state": "IDLE",
+            "number": None, "otp": None,
+            "pending_link": None, "pending_type": None,
+            "pending_links": None, "pending_name": None,
         }
-        self.file_counter += 1
 
-    async def update_dl(self, task_id, current, total):
-        task = self.tasks.get(task_id)
-        if not task: return
-        now = time.time()
-        if task["dl_start"] == 0: task["dl_start"] = now
-        task["dl_current"] = current
-        if total > 0: task["size"] = total
-        dt = now - task["dl_start"]
-        task["dl_speed"] = current / dt if dt > 0 else 0
-        task["action"] = "Downloading"
-        await self._render_ui(force=False)
-
-    async def update_ul(self, task_id, current, total):
-        task = self.tasks.get(task_id)
-        if not task: return
-        now = time.time()
-        if task["ul_start"] == 0: task["ul_start"] = now
-        task["ul_current"] = current
-        if total > 0: task["size"] = total
-        dt = now - task["ul_start"]
-        task["ul_speed"] = current / dt if dt > 0 else 0
-        task["action"] = "Uploading"
-        await self._render_ui(force=False)
-
-    async def update_status_only(self, task_id, action):
-        task = self.tasks.get(task_id)
-        if not task: return
-        task["action"] = action
-        await self._render_ui(force=True)
-
-    async def _render_ui(self, force=False):
-        now = time.time()
-        if not force and (now - self.last_update_time < 6.0): return
-        self.last_update_time = now
-        
-        text = f"📦 **Processing [{self.total_files} Files]**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        for tid, t in self.tasks.items():
-            text += f"📄 **{t['index']}. {t['name']}**\n"
-            text += f"├ 📈 **Status:** {t['action']}\n"
-            
-            if t["action"] in ["Downloading", "Uploading"]:
-                is_dl = t["action"] == "Downloading"
-                current = t["dl_current"] if is_dl else t["ul_current"]
-                speed = t["dl_speed"] if is_dl else t["ul_speed"]
-                total = t["size"]
-                pct = (current / total * 100) if total > 0 else 0
-                text += f"├ 📊 {format_bytes(current)} / {format_bytes(total)} (⚡ {format_bytes(speed)}/s) [{pct:.1f}%]\n"
-            text += "\n"
-
+    def msg(self, text, uid=None):
+        target = uid or self.chat_id
         try:
-            if len(text) > 4000: text = text[:3900] + "\n... (Truncated)"
-            await self.message.edit_text(text, disable_web_page_preview=True)
-        except Exception: pass
+            self.bot.send_message(target, text)
+        except:
+            try: self.bot.send_message(target, re.sub(r'[*_`\[\]]', '', text))
+            except: pass
 
-# --- DOWNLOADERS (Raw CDN, MediaFire, Google Drive) ---
-async def download_mediafire_direct(url):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20) as res:
-            text = await res.text()
-            match = re.search(r'https?://download[0-9]+\.mediafire\.com/[^\s"\'>]+', text)
-            if match: return match.group(0)
-    return url
-
-async def download_direct_link(url, filepath, task_id, tracker):
-    if "drive.google.com" in url:
-        await tracker.update_status_only(task_id, "Downloading from Google Drive")
-        loop = asyncio.get_event_loop()
-        file_id = re.search(r'/d/([a-zA-Z0-9-_]+)', url) or re.search(r'id=([a-zA-Z0-9-_]+)', url)
-        if file_id:
-            await loop.run_in_executor(None, lambda: gdown.download(id=file_id.group(1), output=filepath, quiet=True, fuzzy=True))
-            return filepath
-            
-    if "mediafire.com" in url:
-        await tracker.update_status_only(task_id, "Bypassing MediaFire...")
-        url = await download_mediafire_direct(url)
-
-    timeout = aiohttp.ClientTimeout(total=3600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}) as response:
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            current_size = 0
-            
-            async with aiofiles.open(filepath, 'wb') as f:
-                async for chunk in response.content.iter_chunked(4 * 1024 * 1024): 
-                    if task_id in cancelled_tasks: raise asyncio.CancelledError()
-                    if chunk:
-                        await f.write(chunk)
-                        current_size += len(chunk)
-                        await tracker.update_dl(task_id, current_size, total_size)
-    return filepath
-
-# --- EXTRACTOR ---
-def extract_archive(filepath):
-    extract_dir = filepath + "_extracted"
-    os.makedirs(extract_dir, exist_ok=True)
-    extracted_files = []
-    try:
-        shutil.unpack_archive(filepath, extract_dir)
-        for root, _, files in os.walk(extract_dir):
-            for f in files:
-                extracted_files.append(os.path.join(root, f))
-    except Exception as e:
-        print(f"Extraction failed: {e}")
-    return extracted_files
-
-# --- API LOGIN ---
-async def do_api_login(client, message, number, user_id):
-    msg = await message.reply("⚙️ *Initializing secure session...*")
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
-    loop = asyncio.get_event_loop()
-    
-    try:
-        random_state = random.randint(10000, 99999)
-        auth_url = f"https://jazzdrive.com.pk/oauth2/authorization.php?response_type=code&client_id=web&state={random_state}&redirect_uri=https://cloud.jazzdrive.com.pk/ui/html/oauth.html"
-        res1 = await loop.run_in_executor(None, lambda: session.get(auth_url, timeout=15, allow_redirects=True))
-        signup_url = res1.url 
-        
-        post_url = signup_url
-        form_action_match = re.search(r'<form[^>]+action\s*=\s*["\']([^"\']+)["\']', res1.text, re.IGNORECASE)
-        if form_action_match: post_url = urljoin(signup_url, form_action_match.group(1).replace('&amp;', '&'))
-
-        payload = {}
-        for match in re.finditer(r'<input([^>]+)>', res1.text, re.IGNORECASE):
-            attr_str = match.group(1)
-            name_m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', attr_str, re.IGNORECASE)
-            val_m = re.search(r'value\s*=\s*["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
-            if name_m: payload[name_m.group(1)] = val_m.group(1) if val_m else ""
-                
-        payload['msisdn'] = number
-        if not any('submit' in k.lower() for k in payload.keys()): payload['submit'] = 'submit'
-
-        session.headers.update({'Referer': signup_url, 'Content-Type': 'application/x-www-form-urlencoded'})
-        res2 = await loop.run_in_executor(None, lambda: session.post(post_url, data=payload, timeout=15, allow_redirects=True))
-        verify_url = res2.url 
-        
-        if "verify.php" not in verify_url: return await msg.edit("❌ **Failed!** Server rejected the number.")
-    except Exception as e:
-        return await msg.edit(f"❌ **Error:**\n`{e}`")
-
-    await msg.edit("🔑 **OTP Sent!**\n\nEnter the **4-digit OTP** sent to your number.")
-    user_states[user_id] = "WAITING_FOR_OTP"
-    login_events[user_id] = asyncio.Future()
-    
-    try: otp = await asyncio.wait_for(login_events[user_id], timeout=300) 
-    except asyncio.TimeoutError: return await msg.edit("⏳ **Timeout!**")
-    
-    await msg.edit("⚙️ *Verifying OTP...*")
-    try:
-        post_url_otp = verify_url
-        form_action_match = re.search(r'<form[^>]+action\s*=\s*["\']([^"\']+)["\']', res2.text, re.IGNORECASE)
-        if form_action_match: post_url_otp = urljoin(verify_url, form_action_match.group(1).replace('&amp;', '&'))
-
-        otp_payload = {}
-        for match in re.finditer(r'<input([^>]+)>', res2.text, re.IGNORECASE):
-            attr_str = match.group(1)
-            name_m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', attr_str, re.IGNORECASE)
-            val_m = re.search(r'value\s*=\s*["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
-            if name_m: otp_payload[name_m.group(1)] = val_m.group(1) if val_m else ""
-                
-        otp_payload['otp'] = otp
-        if not any('submit' in k.lower() for k in otp_payload.keys()): otp_payload['submit'] = 'submit'
-        
-        session.headers.update({'Referer': verify_url})
-        res3 = await loop.run_in_executor(None, lambda: session.post(post_url_otp, data=otp_payload, timeout=15, allow_redirects=True))
-        parsed_url = urlparse(res3.url)
-        query_params = parse_qs(parsed_url.query)
-        
-        if 'code' not in query_params: return await msg.edit("❌ **Error:** Server rejected the OTP.")
-        auth_code = query_params['code'][0]
-        
-        oauth_api_url = f"https://cloud.jazzdrive.com.pk/sapi/login/oauth?action=login&platform=web&keytype=authorizationcode&key={auth_code}"
-        res4 = await loop.run_in_executor(None, lambda: session.get(oauth_api_url, timeout=15))
-        
-        val_key = res4.json().get('data', {}).get('validationkey') or res4.json().get('validationkey') or session.cookies.get('validationKey')
-                        
-        if val_key:
-            formatted_cookies = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path} for c in session.cookies]
-            if not any(c['name'] == 'validationKey' for c in formatted_cookies):
-                formatted_cookies.append({"name": "validationKey", "value": val_key, "domain": "cloud.jazzdrive.com.pk", "path": "/"})
-            with open(get_cookie_file(user_id), "w") as f: json.dump({"cookies": formatted_cookies}, f, indent=4)
-            return await msg.edit("✅ **Login Successful!**")
-        else: return await msg.edit("❌ **Error:** Failed to extract validation key.")
-    except Exception as e: return await msg.edit(f"❌ **Verification Error:**\n`{e}`")
-
-# --- USER COMMANDS ---
-@app.on_message(filters.command("login"))
-async def login_cmd(client, message):
-    if message.from_user.id not in allowed_users: return
-    user_id = message.from_user.id
-    if os.path.exists(get_cookie_file(user_id)):
-        await message.reply("⚠️ Active session found. Overwriting...")
-    user_states[user_id] = "WAITING_FOR_NUMBER"
-    await message.reply("📱 Enter your phone number **[03xxxxxxxxx]**:")
-
-@app.on_message(filters.command("link"))
-async def link_cmd(client, message):
-    if message.from_user.id not in allowed_users: return
-    command_text = message.text.replace("/link", "", 1).strip()
-    if not command_text or " - " not in command_text:
-        return await message.reply("⚠️ **Format:** `/link https://url - Name - .mp4`")
-    try:
-        parts = command_text.split(" - ")
-        job_data = {"is_batch": False, "extract": False, "batch_name": f"{parts[1].strip()}{parts[2].strip()}", "links": [{"url": parts[0].strip(), "filename": f"{parts[1].strip()}{parts[2].strip()}"}]}
-        try: await message.delete()
-        except: pass
-        await check_login_and_ask_folder(client, message, message.from_user.id, job_data)
-    except Exception: await message.reply("❌ Invalid format.")
-
-@app.on_message(filters.command("mlink"))
-async def mlink_cmd(client, message):
-    if message.from_user.id not in allowed_users: return
-    command_text = message.text.replace("/mlink", "", 1).strip()
-    lines = [line.strip() for line in command_text.split("\n") if line.strip()]
-    links_data = []
-    for line in lines:
-        if " - " in line:
-            parts = line.split(" - ")
-            links_data.append({"url": parts[0].strip(), "filename": f"{parts[1].strip()}{parts[2].strip()}"})
-        
-    if not links_data: return await message.reply("❌ No valid links found.")
-    user_id = message.from_user.id
-    job_data = {"is_batch": True, "extract": False, "links": links_data}
-    try: await message.delete()
-    except: pass
-    user_states[user_id] = {"action": "WAITING_FOR_BATCH_NAME", "data": job_data}
-    await message.reply(f"✅ {len(links_data)} links detected. Reply with **folder name**:")
-
-@app.on_message(filters.command("unzip"))
-async def unzip_cmd(client, message):
-    if message.from_user.id not in allowed_users: return
-    command_text = message.text.replace("/unzip", "", 1).strip()
-    if not command_text or " - " not in command_text:
-        return await message.reply("⚠️ **Format:** `/unzip https://url - Name - .zip`")
-    try:
-        parts = command_text.split(" - ")
-        job_data = {"is_batch": True, "extract": True, "batch_name": f"{parts[1].strip()}{parts[2].strip()}", "links": [{"url": parts[0].strip(), "filename": f"{parts[1].strip()}{parts[2].strip()}"}]}
-        try: await message.delete()
-        except: pass
-        await check_login_and_ask_folder(client, message, message.from_user.id, job_data)
-    except Exception: await message.reply("❌ Invalid format.")
-
-@app.on_message(filters.text & filters.private)
-async def text_handler(client, message):
-    if message.from_user.id not in allowed_users: return
-    user_id = message.from_user.id
-    state = user_states.get(user_id)
-
-    if state == "WAITING_FOR_NUMBER":
-        user_states[user_id] = None
-        asyncio.create_task(do_api_login(client, message, message.text, user_id))
-    elif state == "WAITING_FOR_OTP":
-        user_states[user_id] = None
-        if user_id in login_events and not login_events[user_id].done():
-            login_events[user_id].set_result(message.text)
-    elif isinstance(state, dict) and state.get("action") == "WAITING_FOR_BATCH_NAME":
-        job_data = state["data"]
-        job_data["batch_name"] = message.text
-        user_states[user_id] = None
-        try: await message.delete()
-        except: pass
-        await check_login_and_ask_folder(client, message, user_id, job_data)
-
-async def check_login_and_ask_folder(client, message, user_id, job_data):
-    cookies, key = load_cookies(user_id)
-    if not key: return await client.send_message(user_id, "❌ Please authenticate using `/login` first.")
-    
-    msg = await client.send_message(user_id, "🔎 *Retrieving cloud directories...*")
-    loop = asyncio.get_event_loop()
-    folders, root_id = await loop.run_in_executor(None, get_cloud_folders, cookies, key)
-    
-    if not root_id: return await msg.edit("❌ **Session Expired!** Please `/login` again.")
-
-    job_id = str(uuid.uuid4())[:8]
-    if user_id not in user_pending_jobs: user_pending_jobs[user_id] = {}
-    user_pending_jobs[user_id][job_id] = job_data
-
-    buttons = [[InlineKeyboardButton("🏠 ROOT Directory", callback_data=f"up_{root_id}_{job_id}")]]
-    row = []
-    for fname, fid in folders:
-        row.append(InlineKeyboardButton(f"📁 {fname}", callback_data=f"up_{fid}_{job_id}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row: buttons.append(row)
-            
-    await msg.edit(f"✅ Select a destination path for **{job_data['batch_name']}**:", reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query(filters.regex(r"^up_"))
-async def folder_selected(client, query):
-    user_id = query.from_user.id
-    if user_id not in allowed_users: return await query.answer("Unauthorized", show_alert=True)
-    
-    parts = query.data.split("_")
-    folder_id = int(parts[1])
-    job_id = parts[2]
-    
-    data = user_pending_jobs.get(user_id, {}).get(job_id)
-    if not data: return await query.answer("⚠️ Session expired.", show_alert=True)
-    user_pending_jobs[user_id].pop(job_id, None)
-    
-    batch_name = data.get("batch_name", "Uploads")
-    is_batch = data.get("is_batch", False)
-    extract_mode = data.get("extract", False)
-    
-    cookies, key = load_cookies(user_id)
-    loop = asyncio.get_event_loop()
-    
-    target_folder_id = folder_id
-    if is_batch and not extract_mode:
-        await query.message.edit_text(f"📁 *Creating remote folder '{batch_name}'...*")
-        target_folder_id = await loop.run_in_executor(None, create_cloud_folder, batch_name, folder_id, cookies, key)
-    elif extract_mode:
-        await query.message.edit_text(f"📁 *Creating remote folder '{batch_name}' for Extracted Files...*")
-        target_folder_id = await loop.run_in_executor(None, create_cloud_folder, batch_name + "_Extracted", folder_id, cookies, key)
-    
-    try: await query.message.delete()
-    except: pass
-    
-    tasks_list = data.get("links", [])
-    if not tasks_list: return await client.send_message(user_id, "❌ No valid payload mapped.")
-
-    status_msg = await client.send_message(user_id, "🔄 *Starting Tasks...*")
-    tracker = MultiProgressTracker(status_msg, len(tasks_list), is_batch)
-    
-    if user_id not in user_semaphores:
-        user_semaphores[user_id] = asyncio.Semaphore(bot_settings.get("owner_concurrent", 3))
-
-    async def process_item(idx, item):
-        task_id = f"t{job_id[:3]}{idx}" 
-        safe_filename = re.sub(r'[\\/*?:"<>|]', "", item["filename"])
-        local_path = os.path.abspath(os.path.join(os.getcwd(), f"temp_{task_id}_{safe_filename}"))
-
-        await tracker.update_status_only(task_id, "Queued")
-        
-        files_to_upload = []
-
+    def send_photo(self, path, caption=""):
         try:
-            async with user_semaphores[user_id]:
-                # --- DOWNLOAD PHASE ---
-                url = item["url"]
-                await tracker.update_status_only(task_id, "Downloading Raw CDN Link")
-                await download_direct_link(url, local_path, task_id, tracker)
-                
-                # --- EXTRACT PHASE (IF REQUESTED) ---
-                if extract_mode and local_path.lower().endswith(('.zip', '.rar', '.tar', '.gz')):
-                    await tracker.update_status_only(task_id, "Extracting Archive...")
-                    extracted_list = await loop.run_in_executor(None, extract_archive, local_path)
-                    if extracted_list:
-                        files_to_upload = extracted_list
-                        if os.path.exists(local_path): os.remove(local_path)
-                    else:
-                        files_to_upload = [local_path] # Fallback if extract fails
+            with open(path, "rb") as f: self.bot.send_photo(self.chat_id, f, caption=caption)
+        except: pass
+
+    def take_screenshot(self, page, caption=""):
+        try:
+            page.screenshot(path="s.png")
+            self.send_photo("s.png", caption)
+            os.remove("s.png")
+        except: pass
+
+    def next_task_id(self):
+        import uuid
+        return str(uuid.uuid4())[:8]
+
+    def is_cancelled(self, task_id):
+        return task_id and (task_id in self.cancelled or f"all_{self.chat_id}" in self.cancelled)
+
+    # LOGIN
+    def do_login(self, page, context):
+        self.msg("LOGIN REQUIRED\n\nJazz number bhejein\nFormat: 03XXXXXXXXX")
+        self.ctx["state"] = "WAITING_FOR_NUMBER"
+        for _ in range(500):
+            if self.ctx["state"] == "NUMBER_RECEIVED": break
+            time.sleep(1)
+        else:
+            self.msg("Timeout! Task cancel."); return False
+        page.locator("#msisdn").fill(self.ctx["number"])
+        time.sleep(1)
+        page.locator("#signinbtn").first.click()
+        time.sleep(3)
+        self.take_screenshot(page, "Number submit")
+        self.msg("Number accept!\n\nOTP bhejein:")
+        self.ctx["state"] = "WAITING_FOR_OTP"
+        for _ in range(500):
+            if self.ctx["state"] == "OTP_RECEIVED": break
+            time.sleep(1)
+        else:
+            self.msg("Timeout! Task cancel."); return False
+        for i, digit in enumerate(self.ctx["otp"].strip()[:6], 1):
+            try:
+                f = page.locator(f"//input[@aria-label='Digit {i}']")
+                if f.is_visible(): f.fill(digit); time.sleep(0.2)
+            except: pass
+        time.sleep(5)
+        self.take_screenshot(page, "OTP submit")
+        context.storage_state(path=self.state_file)
+        self.msg("LOGIN SUCCESSFUL!\nSession save!\nLink bhejein")
+        self.ctx["state"] = "IDLE"
+        return True
+
+    def check_login_status(self):
+        self.msg("Jazz Drive login check...")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                storage_state=self.state_file if os.path.exists(self.state_file) else None
+            )
+            page = ctx.new_page()
+            try:
+                page.goto("https://cloud.jazzdrive.com.pk/", wait_until="networkidle", timeout=90000)
+                time.sleep(3)
+                if page.locator("#msisdn").is_visible():
+                    self.msg("Session expire!\nLogin karte hain...")
+                    self.do_login(page, ctx)
                 else:
-                    files_to_upload = [local_path]
+                    self.msg("LOGIN VALID!\nLink bhejein!")
+            except Exception as e:
+                self.msg(f"Error: {str(e)[:150]}")
+            finally:
+                browser.close()
 
-                # --- UPLOAD PHASE ---
-                for f_path in files_to_upload:
-                    if not os.path.exists(f_path): continue
-                    
-                    up_filename = os.path.basename(f_path)
-                    fsize = os.path.getsize(f_path)
-                    mime = mimetypes.guess_type(f_path)[0] or 'application/octet-stream'
-                    
-                    # STRICT FOLDER ADHERENCE (Uploads strictly inside target_folder_id)
-                    metadata = {"name": up_filename, "size": str(fsize), "folderid": str(target_folder_id), "contenttype": mime, "modificationdate": datetime.now().strftime("%Y%m%dT%H%M%SZ")}
-                    
-                    session = requests.Session()
-                    adapter = HTTPAdapter(max_retries=Retry(total=5, backoff_factor=0.5))
-                    session.mount("https://", adapter)
-                    headers = {'User-Agent': 'Mozilla/5.0'}
+    # DOWNLOAD
+    def download_file(self, url, out_path, task_id=None):
+        last_error = "Unknown"
+        clean(out_path)
+        referers = get_referers(url)
 
-                    class UploadMonitor:
-                        def __init__(self, t_id): self.t_id = t_id
-                        def callback(self, monitor_obj, file_size):
-                            asyncio.run_coroutine_threadsafe(tracker.update_ul(self.t_id, monitor_obj.bytes_read, file_size), loop)
-
-                    def upload_thread():
-                        with open(f_path, 'rb') as f:
-                            up_mon = UploadMonitor(task_id)
-                            m = MultipartEncoder(fields={'data': (None, json.dumps({"data": metadata}), 'application/json'), 'file': (up_filename, f, mime)})
-                            headers['Content-Type'] = monitor.content_type
-                            res = session.post(f"https://cloud.jazzdrive.com.pk/sapi/upload?action=save&acceptasynchronous=true&validationkey={key}", data=monitor, headers=headers, cookies=cookies, timeout=600)
-                            return res.status_code == 200
-
-                    success = await loop.run_in_executor(None, upload_thread)
-                    if not success:
-                        print(f"Failed to upload: {up_filename}")
-                
-                await tracker.update_status_only(task_id, "Completed")
-
-        except Exception as e:
-            print(e)
-            await tracker.update_status_only(task_id, "Failed")
-        finally:
-            if os.path.exists(local_path): 
-                try: os.remove(local_path)
-                except: pass
-            if extract_mode:
-                extract_dir = local_path + "_extracted"
-                if os.path.exists(extract_dir):
-                    try: shutil.rmtree(extract_dir)
-                    except: pass
-
-    if is_batch:
-        for idx, item in enumerate(tasks_list): await process_item(idx, item)
-    else:
-        await asyncio.gather(*(asyncio.create_task(process_item(idx, item)) for idx, item in enumerate(tasks_list)))
-    
-    await status_msg.edit(f"🏁 **Upload Completed!** All files safely uploaded to JazzDrive.")
-
-# --- SMART COOKIES ALIVE PING SYSTEM ---
-async def ping_sessions():
-    while True:
-        interval = bot_settings.get("ping_interval", 5)
-        await asyncio.sleep(interval * 60)
-        for uid in list(allowed_users):
-            cookies, key = load_cookies(uid)
-            if cookies and key:
+        if is_m3u8(url):
+            if not out_path.endswith('.mp4'):
+                out_path = out_path.rsplit('.', 1)[0] + '.mp4'
+            for referer in referers[:2]:
+                if self.is_cancelled(task_id): return None, "Cancelled"
+                clean(out_path)
                 try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, get_cloud_folders, cookies, key)
-                except Exception: pass
+                    cmd = ["ffmpeg", "-y"]
+                    if referer: cmd += ["-headers", f"Referer: {referer}\r\nUser-Agent: {WEB_UA}\r\n"]
+                    else: cmd += ["-user_agent", WEB_UA]
+                    cmd += ["-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", out_path]
+                    subprocess.run(cmd, capture_output=True, timeout=600)
+                    if file_ok(out_path): return out_path, "Success"
+                except Exception as e: last_error = str(e)
+            return None, f"M3U8 fail: {last_error}"
 
-# --- DUMMY WEB SERVER FOR CLOUD HOSTING ---
-async def health_check(request):
-    return web.Response(text="Bot is running perfectly!")
+        try:
+            import yt_dlp
+            tmp_template = out_path.rsplit('.', 1)[0] + '.%(ext)s'
+            ydl_opts = {
+                "outtmpl": tmp_template, "quiet": True, "no_warnings": True,
+                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "merge_output_format": "mp4",
+                "http_headers": {"User-Agent": WEB_UA, "Referer": referers[0], "Origin": referers[0].rstrip("/")},
+                "socket_timeout": 30,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
+            base = out_path.rsplit('.', 1)[0]
+            for ext in VIDEO_EXTS:
+                candidate = base + ext
+                if file_ok(candidate, min_mb=0.1): return candidate, "Success"
+            if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+        except Exception as e: last_error = f"yt-dlp: {str(e)[:100]}"
 
-async def start_web_server():
-    web_app = web.Application()
-    web_app.router.add_get('/', health_check)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
+        for referer in referers:
+            if self.is_cancelled(task_id): return None, "Cancelled"
+            clean(out_path)
+            try:
+                cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M",
+                       "--max-tries=3", "--retry-wait=5", "--allow-overwrite=true",
+                       f"--user-agent={WEB_UA}",
+                       "-d", os.path.dirname(out_path) or "/tmp",
+                       "-o", os.path.basename(out_path)]
+                if referer: cmd += [f"--referer={referer}", f"--header=Origin: {referer.rstrip('/')}"]
+                cmd.append(url)
+                result = subprocess.run(cmd, capture_output=True, timeout=600)
+                if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+                last_error = "aria2c: " + result.stderr.decode()[:100]
+            except Exception as e: last_error = f"aria2c: {str(e)[:100]}"
 
-# --- START BOT ---
-async def main():
-    print("🤖 PRO Bot starting...")
-    await app.start()
-    await start_web_server()
-    asyncio.create_task(ping_sessions())
-    print("✅ Bot is fully active!")
-    await idle()
-    await app.stop()
+        for referer in referers:
+            if self.is_cancelled(task_id): return None, "Cancelled"
+            clean(out_path)
+            try:
+                cmd = ["curl", "-L", "-k", "--retry", "3", "--retry-delay", "3",
+                       "--connect-timeout", "30", "-H", f"User-Agent: {WEB_UA}", "-o", out_path]
+                if referer: cmd += ["-H", f"Referer: {referer}", "-H", f"Origin: {referer.rstrip('/')}"]
+                cmd.append(url)
+                subprocess.run(cmd, timeout=600)
+                if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+            except Exception as e: last_error = f"curl: {str(e)[:100]}"
+
+        for referer in referers[:2]:
+            if self.is_cancelled(task_id): return None, "Cancelled"
+            clean(out_path)
+            try:
+                cmd = ["wget", "-q", "--tries=3", "--timeout=120",
+                       f"--user-agent={WEB_UA}", "-O", out_path]
+                if referer: cmd += [f"--referer={referer}"]
+                cmd.append(url)
+                subprocess.run(cmd, timeout=600)
+                if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+            except Exception as e: last_error = f"wget: {str(e)[:100]}"
+
+        for referer in referers:
+            if self.is_cancelled(task_id): return None, "Cancelled"
+            clean(out_path)
+            try:
+                hdrs = {"User-Agent": WEB_UA}
+                if referer: hdrs["Referer"] = referer; hdrs["Origin"] = referer.rstrip("/")
+                with requests.get(url, headers=hdrs, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(out_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk: f.write(chunk)
+                if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+            except Exception as e: last_error = f"requests: {str(e)[:100]}"
+
+        return None, last_error
+
+    # SPLIT
+    def split_video(self, filepath):
+        size_mb = os.path.getsize(filepath) / (1024*1024)
+        if size_mb <= MAX_SIZE_MB: return [filepath]
+        self.msg(f"File {size_mb:.0f}MB splitting...")
+        base = filepath.rsplit(".", 1)[0]; ext = filepath.rsplit(".", 1)[-1]
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+            capture_output=True, text=True)
+        try: total_duration = float(result.stdout.strip())
+        except: return [filepath]
+        num_parts = int(size_mb / MAX_SIZE_MB) + 1
+        part_duration = total_duration / num_parts
+        parts = []
+        for i in range(num_parts):
+            part_path = f"{base}_part{i+1}.{ext}"
+            subprocess.run(["ffmpeg", "-y", "-i", filepath,
+                "-ss", str(i * part_duration), "-t", str(part_duration),
+                "-c", "copy", part_path], capture_output=True, timeout=3600)
+            if os.path.exists(part_path) and os.path.getsize(part_path) > 1024:
+                parts.append(part_path)
+        if parts: clean(filepath)
+        return parts if parts else [filepath]
+
+    # SHARE LINK
+    def get_share_link(self, page, filename):
+        share_link = None
+        try:
+            self.msg("Share link nikal raha hoon...")
+            page.reload(wait_until="networkidle")
+            time.sleep(5)
+            short_name = os.path.basename(filename)[:25]
+            file_element = page.get_by_text(short_name).first
+            if file_element.is_visible():
+                file_element.click(button="right")
+                time.sleep(2)
+                share_btn = None
+                for selector in ["text=Share", '[data-testid="ShareIcon"]',
+                                  "button:has-text('Share')", "li:has-text('Share')"]:
+                    try:
+                        btn = page.locator(selector).first
+                        if btn.is_visible(timeout=2000): share_btn = btn; break
+                    except: pass
+                if share_btn:
+                    share_btn.click()
+                    time.sleep(3)
+                    for input_sel in ['input[name="get-link-url"]', 'input[readonly]', 'input[type="text"]']:
+                        try:
+                            inp = page.locator(input_sel).first
+                            if inp.is_visible(timeout=2000):
+                                val = inp.get_attribute("value")
+                                if val and val.startswith("http"): share_link = val; break
+                        except: pass
+                    page.keyboard.press("Escape")
+                    time.sleep(1)
+        except Exception as e: self.msg(f"Share link error: {str(e)[:100]}")
+        return share_link
+
+    # UPLOAD
+    def jazz_drive_upload(self, filename, folder_name=""):
+        share_link = None
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                storage_state=self.state_file if os.path.exists(self.state_file) else None
+            )
+            page = ctx.new_page()
+            try:
+                page.goto("https://cloud.jazzdrive.com.pk/#folders", wait_until="networkidle", timeout=90000)
+                time.sleep(5)
+                if page.locator("#msisdn").is_visible():
+                    self.msg("Session expire! Login karo...")
+                    ok = self.do_login(page, ctx)
+                    if not ok: self.msg("Login fail."); return None
+                    page.goto("https://cloud.jazzdrive.com.pk/#folders", wait_until="networkidle", timeout=90000)
+                    time.sleep(5)
+
+                # FOLDER SELECTION
+                if folder_name and folder_name.strip().upper() not in ("ROOT", ""):
+                    try:
+                        page.get_by_text(folder_name.strip(), exact=False).first.click(timeout=5000)
+                        time.sleep(3)
+                        self.msg(f"Folder: {folder_name}")
+                    except:
+                        self.msg(f"Folder '{folder_name}' nahi mila — root mein upload")
+
+                ctx.storage_state(path=self.state_file)
+                abs_path = os.path.abspath(filename)
+                for sel in ["xpath=/html/body/div/div/div[1]/div/header/div/div/button", "button:has-text('Upload')"]:
+                    try: page.click(sel, timeout=5000); break
+                    except: pass
+                page.wait_for_selector("input[type='file']", state="attached")
+                with page.expect_file_chooser() as fc_info:
+                    page.click("xpath=/html/body/div[2]/div[3]/div/div/form/div/div/div/div[1]")
+                fc_info.value.set_files(abs_path)
+                time.sleep(3)
+                try:
+                    yes_btn = page.get_by_text("Yes", exact=True)
+                    if yes_btn.is_visible(): yes_btn.click()
+                except: pass
+                sz = os.path.getsize(filename) / (1024*1024)
+                wait_sec = max(60, int(sz * 4))
+                self.msg(f"Uploading {os.path.basename(filename)[:50]}... (~{wait_sec}s)")
+                elapsed = 0; upload_done = False
+                while elapsed < wait_sec:
+                    time.sleep(30); elapsed += 30
+                    try:
+                        if page.locator("text=Uploads completed").is_visible():
+                            self.msg(f"Upload complete! ({elapsed}s)")
+                            upload_done = True; break
+                    except: pass
+                    if elapsed % 60 == 0: self.take_screenshot(page, f"Progress {elapsed}s/{wait_sec}s")
+                if not upload_done: self.take_screenshot(page, f"Final check {elapsed}s")
+
+                # SHARE LINK
+                share_link = self.get_share_link(page, filename)
+                ctx.storage_state(path=self.state_file)
+            except Exception as e: self.msg(f"Upload error: {str(e)[:200]}")
+            finally: browser.close()
+        return share_link
+
+    def upload_with_split(self, filepath, folder_name="", task_id=None):
+        if self.is_cancelled(task_id): return []
+        parts = self.split_video(filepath)
+        links = []
+        for i, part in enumerate(parts, 1):
+            if self.is_cancelled(task_id): clean(part); break
+            if len(parts) > 1: self.msg(f"Part {i}/{len(parts)} upload...")
+            link = self.jazz_drive_upload(part, folder_name)
+            if link: links.append(link)
+            clean(part)
+        return links
+
+    # PROCESSORS
+    def process_direct(self, url, filename, folder_name="", task_id=None):
+        # YouTube detect — Cobalt se direct link lo
+        if any(x in url for x in ["youtube.com/watch", "youtu.be/", "youtube.com/shorts"]):
+            self.msg("YouTube link detect hua!\nCobalt se direct link nikal raha hoon...")
+            direct, quality = self.youtube_to_direct(url)
+            if direct:
+                self.msg(f"Direct link mila! ({quality}p)\nDownloading...")
+                url = direct
+                filename = filename or "video.mp4"
+            else:
+                self.msg("Cobalt fail — yt-dlp try karega...")
+        fname = filename or get_filename_from_url(url)
+        out_path = f"/tmp/{safe_filename(fname)}"
+        clean(out_path)
+        self.msg(f"Downloading...\n{fname[:60]}")
+        result, error_msg = self.download_file(url, out_path, task_id)
+        if not result: self.msg(f"Download fail!\n{error_msg[:200]}"); return
+        sz = os.path.getsize(result) / (1024*1024)
+        self.msg(f"Downloaded! {sz:.1f} MB\nUploading...")
+        links = self.upload_with_split(result, folder_name, task_id)
+        if links: self.msg(f"Upload Done!\n\nShare Link:\n{links[0]}")
+        else: self.msg("Upload Done!\n(Share link nahi mila)")
+
+    def process_zip(self, url, folder_name="", task_id=None):
+        import shutil
+        zip_path = f"/tmp/series_{self.chat_id}.zip"
+        extract_dir = f"/tmp/series_{self.chat_id}_extracted"
+        clean(zip_path)
+        if os.path.exists(extract_dir): shutil.rmtree(extract_dir)
+        os.makedirs(extract_dir, exist_ok=True)
+        self.msg("ZIP/Season download ho raha hai...")
+        result, error_msg = self.download_file(url, zip_path, task_id)
+        if not result or not file_ok(zip_path): self.msg(f"ZIP fail!\n{error_msg[:200]}"); return
+        sz = os.path.getsize(zip_path) / (1024*1024)
+        self.msg(f"Downloaded! {sz:.1f} MB\nExtracting...")
+        try:
+            if zipfile.is_zipfile(zip_path):
+                with zipfile.ZipFile(zip_path, "r") as zf: zf.extractall(extract_dir)
+            else: subprocess.run(["unzip", "-o", zip_path, "-d", extract_dir], timeout=120)
+        except Exception as e:
+            try: subprocess.run(["7z", "x", zip_path, f"-o{extract_dir}", "-y"], timeout=120)
+            except: self.msg(f"Extract fail: {str(e)[:100]}"); return
+        clean(zip_path)
+        video_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            for f in sorted(files):
+                if is_video_file(f): video_files.append(os.path.join(root, f))
+        if not video_files: self.msg("ZIP mein koi video nahi mili!"); return
+        self.msg(f"Total {len(video_files)} Episodes mili!\nUpload shuru...")
+        all_links = []
+        for i, video_path in enumerate(video_files, 1):
+            if self.is_cancelled(task_id): self.msg("Season upload cancelled!"); break
+            fname = os.path.basename(video_path)
+            fsize = os.path.getsize(video_path) / (1024*1024)
+            self.msg(f"Episode {i}/{len(video_files)}\n{fname}\n{fsize:.1f} MB")
+            links = self.upload_with_split(video_path, folder_name, task_id)
+            if links: all_links.append(f"Ep {i}: {links[0]}"); self.msg(f"Ep {i} Done!\n{links[0]}")
+            else: all_links.append(f"Ep {i}: Uploaded (No Link)"); self.msg(f"Ep {i} Done!")
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        self.msg(f"SEASON COMPLETE!\nTotal {len(all_links)} episodes.\n\n" + "\n".join(all_links))
+
+    # WORKER
+    def worker_loop(self):
+        try:
+            while not self.task_queue.empty():
+                while self.queue_paused: time.sleep(5)
+                item = self.task_queue.get()
+                task_id = item.get("task_id")
+                if self.is_cancelled(task_id): self.task_queue.task_done(); continue
+                self.msg(f"PROCESSING...\n{item.get('link','')[:80]}")
+                try:
+                    folder = item.get("folder", "")
+                    fname  = item.get("filename", "")
+                    if item["type"] == "zip": self.process_zip(item["link"], folder, task_id)
+                    else: self.process_direct(item["link"], fname, folder, task_id)
+                except Exception as e: self.msg(f"Error: {str(e)[:150]}")
+                finally: self.task_queue.task_done()
+            self.msg("QUEUE COMPLETE!\n\nAgla link bhejein")
+        except Exception as e: self.msg(f"Worker crash: {str(e)[:150]}")
+        finally:
+            with self.worker_lock: self.is_working = False
+
+    def start_worker(self):
+        with self.worker_lock:
+            if not self.is_working:
+                self.is_working = True
+                threading.Thread(target=self.worker_loop, daemon=True).start()
+
+    # HANDLERS
+    def register_handlers(self):
+        bot = self.bot
+
+        @bot.message_handler(commands=["start"])
+        def welcome(m):
+            if m.chat.id not in self.allowed: return
+            self.msg(
+                "JAZZ DRIVE BOT\n\n"
+                "Commands:\n"
+                "/link url - FileName - .ext\n"
+                "  Single file download & upload\n\n"
+                "/mlink\n"
+                "  Batch links (ek line mein ek)\n"
+                "  Format: url - Name - .ext\n\n"
+                "/zip <url>\n"
+                "  Season ZIP extract & upload\n\n"
+                "/ziplink url - FolderName\n"
+                "  ZIP seedha folder mein\n\n"
+                "/cancel <task_id>\n"
+                "/cancelall\n"
+                "/checklogin\n"
+                "/status\n"
+                "/pause  /resume  /clear\n"
+                "/allow <id>  /disallow <id>  (Admin)\n"
+                "/cmd <bash>"
+            )
+
+        @bot.message_handler(commands=["link"])
+        def cmd_link(m):
+            if m.chat.id not in self.allowed: return
+            text = m.text.replace("/link", "", 1).strip()
+            if not text or " - " not in text:
+                bot.reply_to(m, "Format:\n/link https://url - FileName - .mkv"); return
+            try:
+                parts = text.split(" - ")
+                filename = f"{parts[1].strip()}{parts[2].strip()}"
+                self.ctx["pending_link"] = parts[0].strip()
+                self.ctx["pending_type"] = "direct"
+                self.ctx["pending_name"] = filename
+                self.ctx["state"] = "WAITING_FOR_FOLDER"
+                bot.reply_to(m, f"Link mila: {filename}\n\nFolder name bhejein\n(ya 'root')")
+            except:
+                bot.reply_to(m, "Format:\n/link https://... - Episode 1 - .mkv")
+
+        @bot.message_handler(commands=["mlink"])
+        def cmd_mlink(m):
+            if m.chat.id not in self.allowed: return
+            text = m.text.replace("/mlink", "", 1).strip()
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            links = []
+            for line in lines:
+                if " - " in line:
+                    try:
+                        p = line.split(" - ")
+                        links.append({"url": p[0].strip(), "filename": f"{p[1].strip()}{p[2].strip()}"})
+                    except: pass
+            if not links:
+                bot.reply_to(m, "Format (ek line mein ek link):\nurl - Name - .ext"); return
+            self.ctx["pending_links"] = links
+            self.ctx["pending_type"]  = "mlink"
+            self.ctx["state"]         = "WAITING_FOR_FOLDER"
+            bot.reply_to(m, f"{len(links)} links mili!\n\nFolder name bhejein\n(ya 'root')")
+
+        @bot.message_handler(commands=["zip"])
+        def cmd_zip(m):
+            if m.chat.id not in self.allowed: return
+            text = m.text.replace("/zip", "", 1).strip()
+            if text.startswith("http"):
+                self.ctx["pending_link"] = text
+                self.ctx["pending_type"] = "zip"
+                self.ctx["pending_name"] = ""
+                self.ctx["state"]        = "WAITING_FOR_FOLDER"
+                bot.reply_to(m, "Season ZIP link mila!\n\nFolder name bhejein\n(ya 'root')")
+            else:
+                bot.reply_to(m, "Format:\n/zip http://example.com/season.zip")
+
+        @bot.message_handler(commands=["ziplink"])
+        def cmd_ziplink(m):
+            if m.chat.id not in self.allowed: return
+            text = m.text.replace("/ziplink", "", 1).strip()
+            if not text or " - " not in text:
+                bot.reply_to(m, "Format:\n/ziplink https://url - FolderName"); return
+            try:
+                parts = text.split(" - ", 1)
+                folder = parts[1].strip()
+                tid = self.next_task_id()
+                self.task_queue.put({"link": parts[0].strip(), "type": "zip",
+                                     "folder": folder, "filename": "", "task_id": tid})
+                bot.reply_to(m, f"ZIP task added!\nFolder: {folder}\nTask ID: {tid}\nQueue: {self.task_queue.qsize()}")
+                self.start_worker()
+            except:
+                bot.reply_to(m, "Format:\n/ziplink https://... - FolderName")
+
+        @bot.message_handler(commands=["cancel"])
+        def cmd_cancel(m):
+            if m.chat.id not in self.allowed: return
+            parts = m.text.split()
+            if len(parts) < 2: bot.reply_to(m, "Format: /cancel task_id"); return
+            self.cancelled.add(parts[1])
+            bot.reply_to(m, f"Cancel signal sent: {parts[1]}")
+
+        @bot.message_handler(commands=["cancelall"])
+        def cmd_cancelall(m):
+            if m.chat.id not in self.allowed: return
+            self.cancelled.add(f"all_{self.chat_id}")
+            bot.reply_to(m, "Sab tasks cancel ho jayenge!")
+
+        @bot.message_handler(commands=["checklogin"])
+        def cmd_check(m):
+            if m.chat.id != self.chat_id: return
+            threading.Thread(target=self.check_login_status, daemon=True).start()
+
+        @bot.message_handler(commands=["status"])
+        def cmd_status(m):
+            if m.chat.id not in self.allowed: return
+            self.msg(
+                f"BOT STATUS\n\n"
+                f"State: {'Working' if self.is_working else 'Idle'}\n"
+                f"Queue: {self.task_queue.qsize()}\n"
+                f"Paused: {'YES' if self.queue_paused else 'No'}\n"
+                f"Session: {'Active' if os.path.exists(self.state_file) else 'None'}"
+            )
+
+        @bot.message_handler(commands=["pause"])
+        def cmd_pause(m):
+            if m.chat.id not in self.allowed: return
+            self.queue_paused = True; self.msg("Queue paused!")
+
+        @bot.message_handler(commands=["resume"])
+        def cmd_resume(m):
+            if m.chat.id not in self.allowed: return
+            self.queue_paused = False; self.msg("Queue resumed!")
+            self.start_worker()
+
+        @bot.message_handler(commands=["clear"])
+        def cmd_clear(m):
+            if m.chat.id not in self.allowed: return
+            count = self.task_queue.qsize()
+            while not self.task_queue.empty():
+                try: self.task_queue.get_nowait()
+                except: break
+            self.msg(f"Queue cleared! {count} tasks remove.")
+
+        @bot.message_handler(commands=["allow"])
+        def cmd_allow(m):
+            if m.chat.id != self.chat_id: return
+            parts = m.text.split()
+            if len(parts) < 2: bot.reply_to(m, "Format: /allow user_id"); return
+            try:
+                uid = int(parts[1])
+                self.allowed.add(uid); save_allowed(self.allowed)
+                bot.reply_to(m, f"User {uid} authorized.")
+            except: bot.reply_to(m, "Invalid user_id")
+
+        @bot.message_handler(commands=["disallow"])
+        def cmd_disallow(m):
+            if m.chat.id != self.chat_id: return
+            parts = m.text.split()
+            if len(parts) < 2: bot.reply_to(m, "Format: /disallow user_id"); return
+            try:
+                uid = int(parts[1])
+                if uid == self.chat_id: bot.reply_to(m, "Apne aap ko nahi hata sakte!"); return
+                self.allowed.discard(uid); save_allowed(self.allowed)
+                bot.reply_to(m, f"User {uid} removed.")
+            except: bot.reply_to(m, "Invalid user_id")
+
+        @bot.message_handler(commands=["cmd"])
+        def cmd_shell(m):
+            if m.chat.id != self.chat_id: return
+            try:
+                c = m.text.replace("/cmd ", "", 1).strip()
+                out = subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT).decode()
+                bot.reply_to(m, out[:4000])
+            except Exception as e: bot.reply_to(m, f"Error: {e}")
+
+        @bot.message_handler(func=lambda m: True)
+        def handle(m):
+            if m.chat.id not in self.allowed: return
+            text = (m.text or "").strip()
+
+            if self.ctx["state"] == "WAITING_FOR_NUMBER":
+                self.ctx["number"] = text; self.ctx["state"] = "NUMBER_RECEIVED"
+                bot.reply_to(m, "Number receive hua..."); return
+
+            if self.ctx["state"] == "WAITING_FOR_OTP":
+                self.ctx["otp"] = text; self.ctx["state"] = "OTP_RECEIVED"
+                bot.reply_to(m, "OTP receive hua..."); return
+
+            if self.ctx["state"] == "WAITING_FOR_FOLDER":
+                folder = "" if text.strip().upper() in ("ROOT", "") else text.strip()
+                if self.ctx["pending_type"] == "mlink":
+                    for item in self.ctx["pending_links"]:
+                        tid = self.next_task_id()
+                        self.task_queue.put({"link": item["url"], "type": "direct",
+                                             "filename": item["filename"], "folder": folder, "task_id": tid})
+                    count = len(self.ctx["pending_links"])
+                    self.ctx.update({"pending_links": None, "pending_type": None, "state": "IDLE"})
+                    bot.reply_to(m, f"{count} tasks added!\nFolder: {folder or 'Root'}\nQueue: {self.task_queue.qsize()}")
+                else:
+                    tid = self.next_task_id()
+                    self.task_queue.put({
+                        "link": self.ctx["pending_link"],
+                        "type": self.ctx["pending_type"],
+                        "filename": self.ctx.get("pending_name", ""),
+                        "folder": folder, "task_id": tid
+                    })
+                    bot.reply_to(m, f"Task added!\nFolder: {folder or 'Root'}\nTask ID: {tid}\nQueue: {self.task_queue.qsize()}")
+                    self.ctx.update({"pending_link": None, "pending_type": None, "pending_name": None, "state": "IDLE"})
+                self.start_worker(); return
+
+            if text.startswith("http"):
+                if is_zip_url(text): ltype = "zip"; hint = "ZIP/Season link mila!"
+                elif is_m3u8(text): ltype = "direct"; hint = "M3U8/HLS link mila!"
+                else: ltype = "direct"; hint = "Direct link mila!"
+                self.ctx["pending_link"] = text
+                self.ctx["pending_type"] = ltype
+                self.ctx["pending_name"] = get_filename_from_url(text)
+                self.ctx["state"]        = "WAITING_FOR_FOLDER"
+                bot.reply_to(m, f"{hint}\n\nFolder name bhejein\n(ya 'root')")
+            else:
+                bot.reply_to(m, "Link bhejein ya /start dekho")
+
+    # SESSION KEEP-ALIVE — har 5 minute mein ping
+    def session_ping_loop(self):
+        while True:
+            time.sleep(5 * 60)  # 5 minute wait
+            if not os.path.exists(self.state_file):
+                continue
+            try:
+                import json
+                with open(self.state_file) as f:
+                    state = json.load(f)
+                cookies = {c["name"]: c["value"] for c in state.get("cookies", [])}
+                key = cookies.get("validationKey") or cookies.get("validationkey")
+                if not key:
+                    continue
+                # JazzDrive API ko silent ping
+                r = requests.get(
+                    f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}",
+                    cookies=cookies,
+                    headers={"User-Agent": WEB_UA},
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    pass  # session alive
+                else:
+                    self.msg("Session ping fail — /checklogin karo")
+            except Exception as e:
+                pass  # silently fail, next ping pe try hoga
+
+    # COBALT YouTube direct link
+    def youtube_to_direct(self, url):
+        for quality in ["1080", "720", "480"]:
+            try:
+                r = requests.post(
+                    "https://api.cobalt.tools/",
+                    json={"url": url, "videoQuality": quality},
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=30
+                )
+                data = r.json()
+                if data.get("status") in ("redirect", "stream", "tunnel", "picker"):
+                    link = data.get("url")
+                    if link: return link, quality
+            except Exception as e:
+                continue
+        return None, None
+
+    def run(self):
+        self.register_handlers()
+        # Session keep-alive thread start karo
+        threading.Thread(target=self.session_ping_loop, daemon=True).start()
+        self.msg("BOT ONLINE!\n\nDirect / M3U8 / ZIP / YouTube link bhejein\n/start dekho commands ke liye")
+        self.bot.infinity_polling()
+
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    instances = []; threads = []
+    for cfg in BOTS:
+        instance = BotInstance(cfg["token"], cfg["chat_id"], cfg["state_file"])
+        instances.append(instance)
+        t = threading.Thread(target=instance.run, daemon=True)
+        threads.append(t); t.start(); time.sleep(2)
+    for t in threads: t.join()
