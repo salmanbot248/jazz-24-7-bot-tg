@@ -425,16 +425,62 @@ class BotInstance:
         fsize = os.path.getsize(local_path)
         self.msg(f"Uploading {fname[:50]}...\n{fmt_bytes(fsize)}")
 
+        # ── Har 1 minute progress update ──
+        upload_done   = threading.Event()
+        upload_start  = time.time()
+
+        def jazzdrive_screenshot(minute):
+            """JazzDrive website ka live screenshot lo"""
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+                    ctx = browser.new_context(
+                        viewport={"width": 1280, "height": 720},
+                        storage_state=self.state_file if os.path.exists(self.state_file) else None
+                    )
+                    page = ctx.new_page()
+                    page.goto("https://cloud.jazzdrive.com.pk/#folders",
+                              wait_until="networkidle", timeout=30000)
+                    import time as t; t.sleep(3)
+                    path = f"/tmp/jd_shot_{minute}.png"
+                    page.screenshot(path=path, full_page=False)
+                    browser.close()
+                    return path
+            except:
+                return None
+
+        def progress_reporter():
+            minute = 1
+            while not upload_done.wait(timeout=60):
+                shot = jazzdrive_screenshot(minute)
+                if shot:
+                    self.send_photo(shot, f"Upload progress — {minute} min\n{fname[:50]}")
+                    try: os.remove(shot)
+                    except: pass
+                else:
+                    self.msg(f"Uploading... {minute} min\n{fname[:50]}")
+                minute += 1
+
+        reporter_thread = threading.Thread(target=progress_reporter, daemon=True)
+        reporter_thread.start()
+
         try:
             success, file_id = api_upload_file(
                 local_path, fname, folder_id, cookies, key,
                 cancelled_flag=lambda: self.is_cancelled(task_id)
             )
         except Exception as e:
+            upload_done.set()
             self.msg(f"Upload error: {str(e)[:150]}"); return None
+        finally:
+            upload_done.set()
 
         if not success or not file_id:
             self.msg("Upload fail!"); return None
+
+        elapsed_total = int(time.time() - upload_start)
+        self.msg(f"Upload complete! ({elapsed_total}s)\n{fmt_bytes(fsize)}")
 
         # Wait for indexing
         wait = get_index_wait(fsize)
