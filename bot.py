@@ -297,17 +297,64 @@ class BotInstance:
         if is_m3u8(url):
             if not out_path.endswith('.mp4'):
                 out_path = out_path.rsplit('.', 1)[0] + '.mp4'
-            for ref in referers[:2]:
+
+            # ffmpeg auto-install
+            os.system("apt-get install -y ffmpeg > /dev/null 2>&1")
+
+            # surrit.com ya kisi bhi M3U8 ke liye referers
+            m3u8_referers = [
+                urlparse(url).scheme + "://" + urlparse(url).netloc + "/",
+                "https://www.google.com/",
+                "",
+            ]
+
+            for ref in m3u8_referers:
                 if self.is_cancelled(task_id): return None, "Cancelled"
                 clean(out_path)
                 try:
-                    cmd = ["ffmpeg", "-y"]
-                    if ref: cmd += ["-headers", f"Referer: {ref}\r\nUser-Agent: {WEB_UA}\r\n"]
-                    else: cmd += ["-user_agent", WEB_UA]
-                    cmd += ["-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", out_path]
-                    subprocess.run(cmd, capture_output=True, timeout=600)
-                    if file_ok(out_path): return out_path, "Success"
-                except Exception as e: last_error = str(e)
+                    headers_str = f"User-Agent: {WEB_UA}\r\n"
+                    if ref:
+                        headers_str += f"Referer: {ref}\r\nOrigin: {ref.rstrip('/')}\r\n"
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-headers", headers_str,
+                        "-i", url,
+                        "-c", "copy",
+                        "-bsf:a", "aac_adtstoasc",
+                        "-movflags", "+faststart",
+                        out_path
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, timeout=3600)
+                    if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+                    last_error = result.stderr.decode()[-200:] if result.stderr else "ffmpeg fail"
+                except Exception as e:
+                    last_error = str(e)
+
+            # yt-dlp fallback for M3U8
+            try:
+                import yt_dlp
+                clean(out_path)
+                ydl_opts = {
+                    "outtmpl": out_path.rsplit(".", 1)[0] + ".%(ext)s",
+                    "quiet": True, "no_warnings": True,
+                    "format": "best",
+                    "http_headers": {
+                        "User-Agent": WEB_UA,
+                        "Referer": urlparse(url).scheme + "://" + urlparse(url).netloc + "/",
+                    },
+                    "merge_output_format": "mp4",
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                base = out_path.rsplit(".", 1)[0]
+                for ext in [".mp4", ".mkv", ".ts", ".webm"]:
+                    if file_ok(base + ext, min_mb=0.1):
+                        return base + ext, "Success"
+                if file_ok(out_path, min_mb=0.1):
+                    return out_path, "Success"
+            except Exception as e:
+                last_error = f"yt-dlp m3u8: {str(e)[:150]}"
+
             return None, f"M3U8 fail: {last_error}"
 
         try:
