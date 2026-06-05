@@ -330,30 +330,72 @@ class BotInstance:
                 except Exception as e:
                     last_error = str(e)
 
-            # yt-dlp fallback for M3U8
+            # yt-dlp fallback with impersonation (Cloudflare bypass)
             try:
                 import yt_dlp
                 clean(out_path)
-                ydl_opts = {
-                    "outtmpl": out_path.rsplit(".", 1)[0] + ".%(ext)s",
-                    "quiet": True, "no_warnings": True,
-                    "format": "best",
-                    "http_headers": {
-                        "User-Agent": WEB_UA,
-                        "Referer": urlparse(url).scheme + "://" + urlparse(url).netloc + "/",
-                    },
-                    "merge_output_format": "mp4",
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                base = out_path.rsplit(".", 1)[0]
-                for ext in [".mp4", ".mkv", ".ts", ".webm"]:
-                    if file_ok(base + ext, min_mb=0.1):
-                        return base + ext, "Success"
-                if file_ok(out_path, min_mb=0.1):
-                    return out_path, "Success"
+                base_out = out_path.rsplit(".", 1)[0]
+                for impersonate in ["chrome", "safari", None]:
+                    clean(out_path)
+                    try:
+                        ydl_opts = {
+                            "outtmpl": base_out + ".%(ext)s",
+                            "quiet": True, "no_warnings": True,
+                            "format": "best",
+                            "http_headers": {
+                                "User-Agent": WEB_UA,
+                                "Referer": urlparse(url).scheme + "://" + urlparse(url).netloc + "/",
+                            },
+                            "merge_output_format": "mp4",
+                        }
+                        if impersonate:
+                            ydl_opts["impersonate"] = impersonate
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([url])
+                        for ext in [".mp4", ".mkv", ".ts", ".webm"]:
+                            if file_ok(base_out + ext, min_mb=0.1):
+                                return base_out + ext, "Success"
+                        if file_ok(out_path, min_mb=0.1):
+                            return out_path, "Success"
+                    except Exception as e:
+                        last_error = f"yt-dlp({impersonate}): {str(e)[:100]}"
             except Exception as e:
                 last_error = f"yt-dlp m3u8: {str(e)[:150]}"
+
+            # curl_cffi fallback — Cloudflare bypass
+            try:
+                os.system("pip install -q curl_cffi > /dev/null 2>&1")
+                from curl_cffi import requests as cf_requests
+                clean(out_path)
+                # M3U8 playlist fetch
+                cf_sess = cf_requests.Session(impersonate="chrome110")
+                r = cf_sess.get(url, timeout=30)
+                r.raise_for_status()
+                m3u8_content = r.text
+                base_url = url.rsplit("/", 1)[0] + "/"
+                # Parse segments
+                segments = [line.strip() for line in m3u8_content.splitlines()
+                            if line.strip() and not line.startswith("#")]
+                if segments:
+                    self.msg(f"M3U8 segments: {len(segments)} — downloading...")
+                    ts_path = out_path.replace(".mp4", ".ts")
+                    with open(ts_path, "wb") as out_f:
+                        for seg in segments:
+                            seg_url = seg if seg.startswith("http") else base_url + seg
+                            try:
+                                seg_r = cf_sess.get(seg_url, timeout=60)
+                                out_f.write(seg_r.content)
+                            except: pass
+                    # Convert ts to mp4
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", ts_path, "-c", "copy", out_path],
+                        capture_output=True, timeout=600
+                    )
+                    clean(ts_path)
+                    if file_ok(out_path, min_mb=0.1):
+                        return out_path, "Success"
+            except Exception as e:
+                last_error = f"curl_cffi: {str(e)[:150]}"
 
             return None, f"M3U8 fail: {last_error}"
 
