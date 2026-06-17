@@ -13,5 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Install ffmpeg and p7zip
+        run: sudo apt-get install -y ffmpeg p7zip-full
+
       - name: Run Bot
         run: bash start.sh
+        
