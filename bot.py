@@ -17,7 +17,7 @@ def tmdb_info(query):
     try:
         base = "https://api.themoviedb.org/3"
         r = requests.get(base + "/search/multi", params={
-            "api_key": TMDB_API_KEY, "query": query, "include_adult": False
+            "api_key": TMDB_API_KEY, "query": query, "include_adult": True
         }, timeout=10)
         results = [x for x in r.json().get("results", []) if x.get("media_type") in ("movie", "tv")]
         if not results:
