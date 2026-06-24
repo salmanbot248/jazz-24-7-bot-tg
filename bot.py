@@ -13,7 +13,7 @@ ZIP_EXTS   = [".zip", ".rar", ".7z", ".tar", ".gz"]
 MAX_SIZE_MB = 1990
 
 BOTS = [
-    {"token": "8512186971:AAGUia2oicjFlNDgBtM6rC1a7BESGPihisk", "chat_id": 7144917062, "state_file": "state1.json"},
+    {"token": "8570335695:AAGIPOaJ14zZsac9PHtMko0eq5nV5SdCOUE", "chat_id": 7144917062, "state_file": "state1.json"},
 ]
 
 ALLOWED_USERS_FILE = "allowed_users.json"
