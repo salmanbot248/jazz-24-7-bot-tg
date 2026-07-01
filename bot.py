@@ -70,7 +70,7 @@ def tmdb_info(query):
 
 
 BOTS = [
-    {"token": "8570335695:AAGIPOaJ14zZsac9PHtMko0eq5nV5SdCOUE", "chat_id": 7144917062, "state_file": "state1.json"},
+    {"token": "8952643860:AAFe8n4yjAxFowAWpSpT781IfFuKixB4cN0", "chat_id": 7144917062, "state_file": "state1.json"},
 ]
 
 ALLOWED_USERS_FILE = "allowed_users.json"
