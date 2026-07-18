@@ -1,22 +1,58 @@
-name: JazzDrive Bot v6
+name: Run JazzDrive Bot
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'
+  workflow_dispatch:      # Manual "Run workflow" button se chalao
+  # schedule:
+  #   - cron: '0 */6 * * *'   # Chaho to har 6 ghante auto-chalane ke liye uncomment karo
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 350   # GitHub Actions ka max ~6 ghante free tier pe
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
-      - name: Install ffmpeg and p7zip
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (ffmpeg, fonts, aria2)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --fix-missing ffmpeg p7zip-full
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg aria2 fonts-noto
+
+      - name: Install Deno (yt-dlp signature/nsig solver)
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh -s -- -y
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Install Python dependencies
+        run: |
+          pip install -q --upgrade pip
+          pip install -q -U yt-dlp
+          pip install -q -U pytubefix
+          pip install -q pyTelegramBotAPI requests requests_toolbelt playwright urllib3
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Run Bot
-        run: bash start.sh
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python bot.py
+
+      - name: Commit updated session/token files back to repo
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add state1.json yt_token.json allowed_users.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Auto-update session/token files [skip ci]"
+          git push || echo "Nothing to push or push failed"
+          
