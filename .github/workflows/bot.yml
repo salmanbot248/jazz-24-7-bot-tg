@@ -41,6 +41,11 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
+      - name: Configure git (for mid-run feed.json pushes)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Run Bot
         env:
           PYTHONUNBUFFERED: "1"
