@@ -1,0 +1,248 @@
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>ZeroFeed</title>
+<meta name="theme-color" content="#0a0a0a">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body {
+    height:100%; background:#0a0a0a; overflow:hidden;
+    font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color:#f5f5f0;
+  }
+
+  #feed {
+    height:100dvh; width:100vw;
+    overflow-y:scroll; overflow-x:hidden;
+    scroll-snap-type:y mandatory;
+    scroll-behavior:smooth;
+    -webkit-overflow-scrolling:touch;
+  }
+  #feed::-webkit-scrollbar { display:none; }
+
+  .slide {
+    height:100dvh; width:100vw;
+    scroll-snap-align:start; scroll-snap-stop:always;
+    position:relative;
+    display:flex; align-items:center; justify-content:center;
+    background:#000;
+  }
+
+  .slide video {
+    height:100%; width:100%;
+    object-fit:contain;
+    background:#000;
+  }
+
+  .overlay {
+    position:absolute; left:0; right:0; bottom:0;
+    padding:18px 16px 28px;
+    background:linear-gradient(to top, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.35) 55%, transparent 100%);
+    pointer-events:none;
+  }
+  .overlay .platform {
+    display:inline-block;
+    font-size:11px; font-weight:700; letter-spacing:0.08em;
+    text-transform:uppercase;
+    padding:3px 9px; border-radius:20px;
+    background:rgba(255,255,255,0.14);
+    margin-bottom:8px;
+  }
+  .overlay .title {
+    font-size:15px; line-height:1.4; font-weight:500;
+    max-width:88%;
+    text-shadow:0 1px 3px rgba(0,0,0,0.6);
+  }
+
+  .tapzone {
+    position:absolute; inset:0; z-index:2;
+  }
+
+  .spinner {
+    position:absolute; inset:0;
+    display:flex; align-items:center; justify-content:center;
+    pointer-events:none;
+  }
+  .spinner div {
+    width:34px; height:34px;
+    border:3px solid rgba(245,245,240,0.2);
+    border-top-color:#f5f5f0;
+    border-radius:50%;
+    animation:spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  .playpause {
+    position:absolute; inset:0;
+    display:flex; align-items:center; justify-content:center;
+    pointer-events:none;
+    opacity:0; transition:opacity 0.15s;
+  }
+  .playpause.show { opacity:1; }
+  .playpause svg { width:56px; height:56px; filter:drop-shadow(0 2px 6px rgba(0,0,0,0.5)); }
+
+  #empty, #loading {
+    position:fixed; inset:0;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:10px; text-align:center; padding:0 40px;
+  }
+  #empty .big, #loading .big { font-size:17px; font-weight:600; }
+  #empty .small, #loading .small { font-size:13px; color:rgba(245,245,240,0.55); }
+  .hidden { display:none !important; }
+
+  #refresh {
+    position:fixed; top:calc(env(safe-area-inset-top, 12px) + 8px); right:16px;
+    z-index:10;
+    width:38px; height:38px; border-radius:50%;
+    background:rgba(255,255,255,0.12);
+    display:flex; align-items:center; justify-content:center;
+    border:none; color:#f5f5f0;
+  }
+  #refresh svg { width:18px; height:18px; }
+  #refresh.spinning svg { animation:spin 0.7s linear infinite; }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="big">ZeroFeed</div>
+  <div class="small">Loading videos…</div>
+</div>
+
+<div id="empty" class="hidden">
+  <div class="big">No videos yet</div>
+  <div class="small">Send an Instagram or TikTok link to your bot — it'll show up here.</div>
+</div>
+
+<button id="refresh" aria-label="Refresh feed">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="23 4 23 10 17 10"></polyline>
+    <polyline points="1 20 1 14 7 14"></polyline>
+    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+  </svg>
+</button>
+
+<div id="feed"></div>
+
+<script>
+const FEED_URL = './feed.json'; // same repo, relative path
+let items = [];
+let currentIndex = -1;
+
+const feedEl = document.getElementById('feed');
+const loadingEl = document.getElementById('loading');
+const emptyEl = document.getElementById('empty');
+const refreshBtn = document.getElementById('refresh');
+
+function platformLabel(p) {
+  return (p || 'Video').toString();
+}
+
+function buildSlide(item, idx) {
+  const slide = document.createElement('div');
+  slide.className = 'slide';
+  slide.dataset.index = idx;
+
+  const video = document.createElement('video');
+  video.src = item.url;
+  video.loop = true;
+  video.playsInline = true;
+  video.muted = false;
+  video.preload = 'none';
+  video.setAttribute('webkit-playsinline', '');
+
+  const spinner = document.createElement('div');
+  spinner.className = 'spinner';
+  spinner.innerHTML = '<div></div>';
+
+  video.addEventListener('waiting', () => spinner.style.display = 'flex');
+  video.addEventListener('playing', () => spinner.style.display = 'none');
+  video.addEventListener('canplay', () => spinner.style.display = 'none');
+
+  const tap = document.createElement('div');
+  tap.className = 'tapzone';
+  const pp = document.createElement('div');
+  pp.className = 'playpause';
+  pp.innerHTML = `<svg viewBox="0 0 24 24" fill="white"><path id="ppIcon" d="M8 5v14l11-7z"/></svg>`;
+
+  tap.addEventListener('click', () => {
+    if (video.paused) { video.play().catch(()=>{}); }
+    else { video.pause(); }
+    pp.querySelector('#ppIcon').setAttribute('d', video.paused ? 'M8 5v14l11-7z' : 'M6 5h4v14H6zM14 5h4v14h-4z');
+    pp.classList.add('show');
+    setTimeout(() => pp.classList.remove('show'), 350);
+  });
+
+  const overlay = document.createElement('div');
+  overlay.className = 'overlay';
+  overlay.innerHTML = `
+    <div class="platform">${platformLabel(item.platform)}</div>
+    <div class="title">${(item.title || '').toString()}</div>
+  `;
+
+  slide.appendChild(video);
+  slide.appendChild(spinner);
+  slide.appendChild(tap);
+  slide.appendChild(pp);
+  slide.appendChild(overlay);
+  return slide;
+}
+
+function renderFeed() {
+  feedEl.innerHTML = '';
+  items.forEach((item, idx) => feedEl.appendChild(buildSlide(item, idx)));
+}
+
+function activateSlide(idx) {
+  const slides = feedEl.querySelectorAll('.slide');
+  slides.forEach((s, i) => {
+    const v = s.querySelector('video');
+    if (i === idx) {
+      if (!v.src) v.src = items[i].url;
+      v.play().catch(()=>{});
+    } else {
+      v.pause();
+      v.currentTime = 0;
+    }
+  });
+  currentIndex = idx;
+}
+
+let scrollTimeout;
+feedEl.addEventListener('scroll', () => {
+  clearTimeout(scrollTimeout);
+  scrollTimeout = setTimeout(() => {
+    const idx = Math.round(feedEl.scrollTop / feedEl.clientHeight);
+    if (idx !== currentIndex) activateSlide(idx);
+  }, 100);
+});
+
+async function loadFeed(showSpinnerOnBtn) {
+  if (showSpinnerOnBtn) refreshBtn.classList.add('spinning');
+  try {
+    const res = await fetch(FEED_URL + '?t=' + Date.now());
+    const data = await res.json();
+    items = Array.isArray(data) ? data : [];
+  } catch (e) {
+    items = [];
+  }
+  loadingEl.classList.add('hidden');
+  if (items.length === 0) {
+    emptyEl.classList.remove('hidden');
+    feedEl.innerHTML = '';
+  } else {
+    emptyEl.classList.add('hidden');
+    renderFeed();
+    activateSlide(0);
+  }
+  if (showSpinnerOnBtn) refreshBtn.classList.remove('spinning');
+}
+
+refreshBtn.addEventListener('click', () => loadFeed(true));
+
+loadFeed(false);
+</script>
+</body>
+</html>
