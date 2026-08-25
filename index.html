@@ -1,4 +1,4 @@
- <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -30,10 +30,11 @@
     background:#000;
   }
 
-  .slide video {
+  .slide video, .slide .jd-frame {
     height:100%; width:100%;
     object-fit:contain;
     background:#000;
+    border:none;
   }
 
   .overlay {
@@ -145,35 +146,15 @@ function buildSlide(item, idx) {
   slide.className = 'slide';
   slide.dataset.index = idx;
 
-  const video = document.createElement('video');
-  video.src = item.url;
-  video.loop = true;
-  video.playsInline = true;
-  video.muted = false;
-  video.preload = 'none';
-  video.setAttribute('webkit-playsinline', '');
-
-  const spinner = document.createElement('div');
-  spinner.className = 'spinner';
-  spinner.innerHTML = '<div></div>';
-
-  video.addEventListener('waiting', () => spinner.style.display = 'flex');
-  video.addEventListener('playing', () => spinner.style.display = 'none');
-  video.addEventListener('canplay', () => spinner.style.display = 'none');
-
-  const tap = document.createElement('div');
-  tap.className = 'tapzone';
-  const pp = document.createElement('div');
-  pp.className = 'playpause';
-  pp.innerHTML = `<svg viewBox="0 0 24 24" fill="white"><path id="ppIcon" d="M8 5v14l11-7z"/></svg>`;
-
-  tap.addEventListener('click', () => {
-    if (video.paused) { video.play().catch(()=>{}); }
-    else { video.pause(); }
-    pp.querySelector('#ppIcon').setAttribute('d', video.paused ? 'M8 5v14l11-7z' : 'M6 5h4v14H6zM14 5h4v14h-4z');
-    pp.classList.add('show');
-    setTimeout(() => pp.classList.remove('show'), 350);
-  });
+  // JazzDrive share page ko seedha iframe mein embed karte hain —
+  // ye already play ho raha hota hai browser mein, is se direct
+  // video-file URL guess karne ki zaroorat nahi rehti.
+  const frame = document.createElement('iframe');
+  frame.className = 'jd-frame';
+  frame.setAttribute('allow', 'autoplay; fullscreen');
+  frame.setAttribute('allowfullscreen', '');
+  frame.loading = 'lazy';
+  frame.dataset.src = item.url; // lazy: sirf active/adjacent slide load hoga
 
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
@@ -182,10 +163,7 @@ function buildSlide(item, idx) {
     <div class="title">${(item.title || '').toString()}</div>
   `;
 
-  slide.appendChild(video);
-  slide.appendChild(spinner);
-  slide.appendChild(tap);
-  slide.appendChild(pp);
+  slide.appendChild(frame);
   slide.appendChild(overlay);
   return slide;
 }
@@ -195,16 +173,23 @@ function renderFeed() {
   items.forEach((item, idx) => feedEl.appendChild(buildSlide(item, idx)));
 }
 
+function loadFrame(slide) {
+  const frame = slide.querySelector('.jd-frame');
+  if (frame && !frame.src && frame.dataset.src) frame.src = frame.dataset.src;
+}
+
+function unloadFrame(slide) {
+  const frame = slide.querySelector('.jd-frame');
+  if (frame && frame.src) frame.removeAttribute('src'); // pause/stop far slides
+}
+
 function activateSlide(idx) {
   const slides = feedEl.querySelectorAll('.slide');
   slides.forEach((s, i) => {
-    const v = s.querySelector('video');
-    if (i === idx) {
-      if (!v.src) v.src = items[i].url;
-      v.play().catch(()=>{});
+    if (i === idx || i === idx - 1 || i === idx + 1) {
+      loadFrame(s); // current + neighbours preload
     } else {
-      v.pause();
-      v.currentTime = 0;
+      unloadFrame(s); // door wale slides unload — memory/data bachane ke liye
     }
   });
   currentIndex = idx;
