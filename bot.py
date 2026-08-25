@@ -278,7 +278,7 @@ def append_feed(entry):
 
 
 BOTS = [
-    {"token": "8952643860:AAFe8n4yjAxFowAWpSpT781IfFuKixB4cN0", "chat_id": 7144917062, "state_file": "state1.json"},
+    {"token": "8952643860:AAFRMlnzD8utIZcZzFv363xIgVmu6DSSX6Q", "chat_id": 7144917062, "state_file": "state1.json"},
 ]
 
 ALLOWED_USERS_FILE = "allowed_users.json"
