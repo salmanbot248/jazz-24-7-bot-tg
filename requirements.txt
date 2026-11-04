@@ -1,6 +1,0 @@
-pyTelegramBotAPI
-playwright
-requests
-requests-toolbelt
-yt-dlp
-curl_cffi
