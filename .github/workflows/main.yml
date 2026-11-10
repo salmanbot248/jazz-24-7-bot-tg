@@ -1,17 +1,17 @@
 name: Run JazzDrive Bot
 
 on:
-  workflow_dispatch:      # Manual "Run workflow" button se chalao
+  workflow_dispatch:
   # schedule:
-  #   - cron: '0 */6 * * *'   # Chaho to har 6 ghante auto-chalane ke liye uncomment karo
+  #   - cron: '0 */6 * * *'
 
 permissions:
-  contents: write         # feed.json / session files push karne ke liye zaroori
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # GitHub Actions ka max ~6 ghante free tier pe
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repo
@@ -44,7 +44,7 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      - name: Configure git (for mid-run feed.json pushes)
+      - name: Configure git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -52,16 +52,15 @@ jobs:
       - name: Run Bot
         env:
           PYTHONUNBUFFERED: "1"
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}   # optional: set karo to bot.py wale token ki jagah ye use hoga
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          python bot.py
+          python run_bot.py
 
       - name: Commit updated session/token files back to repo
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add state1.json yt_token.json allowed_users.json feed.json instagram_cookies.txt 2>/dev/null || true
+          git add state1.json yt_token.json allowed_users.json feed.json instagram_cookies.txt tiktok_seen.json 2>/dev/null || true
           git diff --staged --quiet || git commit -m "Auto-update session/token files [skip ci]"
           git push || echo "Nothing to push or push failed"
-          
