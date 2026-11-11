@@ -1,7 +1,7 @@
 """
-TikTok Multi-Strategy Auto-Pilot Pipeline (Profiles -> Tags -> Search Fallback).
-- Automatically rotates through multiple discovery strategies.
-- Ensures zero downtime and endless unique video streams.
+TikTok Pure Auto-Pilot Pipeline (No YouTube, Only TikTok Profiles & Tags).
+- Strictly filters out non-TikTok links.
+- Prevents infinite loops and ensures clean feed processing.
 - Leaves bot.py completely untouched.
 """
 
@@ -58,24 +58,26 @@ def _load_json_file(filename, default_list):
             pass
     return default_list
 
-def _get_videos_from_source(url_or_query, is_search=False):
+def _get_videos_from_source(url):
     import yt_dlp
     
-    target = f"ytsearch30:{url_or_query}" if is_search else url_or_query
+    # Sirf TikTok URLs allow karne ke liye check
+    if "tiktok.com" not in url:
+        return []
     
     options = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
-        "playlistend": 30,
+        "playlistend": 20,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
-            result = ydl.extract_info(target, download=False)
+            result = ydl.extract_info(url, download=False)
         except Exception as e:
-            print(f"Error fetching source ({target}): {e}")
+            print(f"Error fetching source ({url}): {e}")
             return []
 
     videos = []
@@ -86,10 +88,15 @@ def _get_videos_from_source(url_or_query, is_search=False):
         video_url = entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
         entry_id = str(entry.get("id") or "").strip()
         
-        if not video_url or not str(video_url).startswith(("http://", "https://")):
-            if not entry_id:
+        if not video_url or "tiktok.com" not in str(video_url):
+            if entry_id:
+                video_url = f"https://www.tiktok.com/video/{entry_id}"
+            else:
                 continue
-            video_url = f"https://www.tiktok.com/video/{entry_id}"
+
+        # Dobara tasdeek ke sirf tiktok URL ho
+        if "tiktok.com" not in str(video_url):
+            continue
 
         video_id = _video_id_from_url(video_url) or entry_id
         if video_id:
@@ -101,38 +108,32 @@ def start_discovery_worker(instance):
     def worker_loop():
         time.sleep(15)
         while True:
-            # Multi-layer strategies tayyar karna
             profiles = _load_json_file(PROFILES_FILE, [])
             tags = _load_json_file(TAGS_FILE, [
                 "https://www.tiktok.com/tag/foryou",
                 "https://www.tiktok.com/tag/trending",
                 "https://www.tiktok.com/tag/viral"
             ])
-            fallback_keywords = ["viral tiktok", "trending edits", "foryoupage clips", "popular viral video"]
             
-            # Sabhi strategies ko aik list mein sequence wise ya mix kar ke rakhna
-            strategies = []
-            
-            # 1. Pehli priority: Profiles aur Tags ko mix kar ke shuffle karein
-            primary_sources = profiles + tags
-            random.shuffle(primary_sources)
-            for src in primary_sources:
-                strategies.append((src, False))
+            # Sirf TikTok profiles aur tags ka combination
+            sources = profiles + tags
+            if not sources:
+                sources = ["https://www.tiktok.com/tag/trending"]
                 
-            # 2. Doosri priority / Fallback: Agar upar kuch na mile ya aur mazeed chahiye ho toh Search keywords
-            random.shuffle(fallback_keywords)
-            for kw in fallback_keywords:
-                strategies.append((kw, True))
+            random.shuffle(sources)
 
             total_added = 0
-            for target, is_search in strategies:
+            for source_url in sources:
                 try:
-                    print(f"Scanning via Strategy [Search={is_search}]: {target}")
-                    videos = _get_videos_from_source(target, is_search=is_search)
+                    print(f"Scanning TikTok source: {source_url}")
+                    videos = _get_videos_from_source(source_url)
                     random.shuffle(videos)
                     
                     added = 0
                     for video_id, video_url in videos:
+                        if "tiktok.com" not in video_url:
+                            continue
+                            
                         with _seen_lock:
                             _seen_ids.update(_load_seen_ids())
                             if video_id in _seen_ids or video_id in _queued_ids:
@@ -149,15 +150,15 @@ def start_discovery_worker(instance):
                         total_added += 1
 
                     if added > 0:
-                        print(f"Successfully added {added} videos from {target}")
+                        print(f"Successfully added {added} TikTok videos from {source_url}")
                         instance.start_worker()
                         
                 except Exception as e:
-                    print(f"Strategy error on {target}: {e}, switching to next...")
+                    print(f"Source error on {source_url}: {e}")
                 
-                time.sleep(20) # Har strategy ke darmiyan chota gap taake load na paray
+                time.sleep(25)
             
-            print(f"Cycle completed. Total new videos queued: {total_added}. Sleeping for {CHECK_INTERVAL/3600} hours...")
+            print(f"Cycle completed. Total new TikTok videos queued: {total_added}. Sleeping for {CHECK_INTERVAL/3600} hours...")
             time.sleep(CHECK_INTERVAL)
 
     t = threading.Thread(target=worker_loop, daemon=True)
@@ -222,4 +223,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+            
