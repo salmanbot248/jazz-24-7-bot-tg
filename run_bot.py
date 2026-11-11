@@ -1,7 +1,8 @@
 """
-TikTok Authenticated & Unlimited Auto-Pilot Add-on.
-- Uses cookies.txt for login session / personal FYP feed access.
-- Automatically fetches unlimited videos with duplicate filtering via tiktok_seen.json.
+TikTok Cookie-less Auto-Pilot Script with Profiles & Tags Support.
+- Automatically fetches unlimited videos from both Specific Profile URLs and Trending Tags.
+- Uses yt-dlp without cookies (public scraping).
+- Prevents duplicates using tiktok_seen.json.
 - Leaves bot.py completely untouched.
 """
 
@@ -12,13 +13,12 @@ import random
 import subprocess
 import threading
 import time
-from urllib.parse import urlparse
 
 import bot as app
 
 SEEN_FILE = "tiktok_seen.json"
 TAGS_FILE = "tiktok_tags.json"
-COOKIES_FILE = "cookies.txt"  # Yahan aapki login session cookies hongi
+PROFILES_FILE = "tiktok_profiles.json"
 CHECK_INTERVAL = 10800  # Har 3 ghante baad naye videos scan honge
 
 _seen_ids = set()
@@ -60,11 +60,21 @@ def _load_tags():
     return [
         "https://www.tiktok.com/tag/foryou",
         "https://www.tiktok.com/tag/trending",
-        "https://www.tiktok.com/tag/viral",
-        "https://www.tiktok.com/tag/foryoupage"
+        "https://www.tiktok.com/tag/viral"
     ]
 
-def _get_trend_videos(tag_url):
+def _load_profiles():
+    if os.path.exists(PROFILES_FILE):
+        try:
+            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+    return []  # Yahan aap apni pasand ke profile URLs dal sakte hain
+
+def _get_videos_from_url(url):
     import yt_dlp
     
     options = {
@@ -72,18 +82,14 @@ def _get_trend_videos(tag_url):
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
-        "playlistend": None, # Unlimited videos extraction
+        "playlistend": 30,  # Har profile/tag se eik dafe mein max 30 videos
     }
-    
-    # Agar cookies file mojood ho toh login session use karein
-    if os.path.exists(COOKIES_FILE):
-        options["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
-            result = ydl.extract_info(tag_url, download=False)
+            result = ydl.extract_info(url, download=False)
         except Exception as e:
-            print(f"Error fetching {tag_url}: {e}")
+            print(f"Error fetching {url}: {e}")
             return []
 
     videos = []
@@ -109,13 +115,20 @@ def start_discovery_worker(instance):
     def worker_loop():
         time.sleep(15)
         while True:
+            # Tags aur Profiles dono ko combine kar lein
             tags = _load_tags()
-            random.shuffle(tags)
+            profiles = _load_profiles()
+            all_sources = tags + profiles
             
-            for tag_url in tags:
+            if not all_sources:
+                all_sources = ["https://www.tiktok.com/tag/trending"]
+                
+            random.shuffle(all_sources)
+            
+            for source_url in all_sources:
                 try:
-                    print(f"Scanning TikTok feed with session/cookies: {tag_url}")
-                    videos = _get_trend_videos(tag_url)
+                    print(f"Scanning TikTok source: {source_url}")
+                    videos = _get_videos_from_url(source_url)
                     random.shuffle(videos)
                     
                     added = 0
@@ -135,11 +148,11 @@ def start_discovery_worker(instance):
                         added += 1
 
                     if added > 0:
-                        print(f"Added {added} unique videos from {tag_url}")
+                        print(f"Added {added} unique videos from {source_url}")
                         instance.start_worker()
                         
                 except Exception as e:
-                    print(f"Worker error on {tag_url}: {e}")
+                    print(f"Worker error on {source_url}: {e}")
                 
                 time.sleep(30)
             
@@ -207,4 +220,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
