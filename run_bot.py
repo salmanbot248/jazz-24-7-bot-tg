@@ -1,8 +1,7 @@
 """
-TikTok Cookie-less Auto-Pilot Script with Profiles & Tags Support.
-- Automatically fetches unlimited videos from both Specific Profile URLs and Trending Tags.
-- Uses yt-dlp without cookies (public scraping).
-- Prevents duplicates using tiktok_seen.json.
+TikTok Multi-Strategy Auto-Pilot Pipeline (Profiles -> Tags -> Search Fallback).
+- Automatically rotates through multiple discovery strategies.
+- Ensures zero downtime and endless unique video streams.
 - Leaves bot.py completely untouched.
 """
 
@@ -48,48 +47,35 @@ def _video_id_from_url(url):
     match = re.search(r"/video/(\d+)", url or "")
     return match.group(1) if match else None
 
-def _load_tags():
-    if os.path.exists(TAGS_FILE):
+def _load_json_file(filename, default_list):
+    if os.path.exists(filename):
         try:
-            with open(TAGS_FILE, "r", encoding="utf-8") as f:
+            with open(filename, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list):
+                if isinstance(data, list) and data:
                     return data
         except Exception:
             pass
-    return [
-        "https://www.tiktok.com/tag/foryou",
-        "https://www.tiktok.com/tag/trending",
-        "https://www.tiktok.com/tag/viral"
-    ]
+    return default_list
 
-def _load_profiles():
-    if os.path.exists(PROFILES_FILE):
-        try:
-            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            pass
-    return []  # Yahan aap apni pasand ke profile URLs dal sakte hain
-
-def _get_videos_from_url(url):
+def _get_videos_from_source(url_or_query, is_search=False):
     import yt_dlp
+    
+    target = f"ytsearch30:{url_or_query}" if is_search else url_or_query
     
     options = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
-        "playlistend": 30,  # Har profile/tag se eik dafe mein max 30 videos
+        "playlistend": 30,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
-            result = ydl.extract_info(url, download=False)
+            result = ydl.extract_info(target, download=False)
         except Exception as e:
-            print(f"Error fetching {url}: {e}")
+            print(f"Error fetching source ({target}): {e}")
             return []
 
     videos = []
@@ -115,20 +101,34 @@ def start_discovery_worker(instance):
     def worker_loop():
         time.sleep(15)
         while True:
-            # Tags aur Profiles dono ko combine kar lein
-            tags = _load_tags()
-            profiles = _load_profiles()
-            all_sources = tags + profiles
+            # Multi-layer strategies tayyar karna
+            profiles = _load_json_file(PROFILES_FILE, [])
+            tags = _load_json_file(TAGS_FILE, [
+                "https://www.tiktok.com/tag/foryou",
+                "https://www.tiktok.com/tag/trending",
+                "https://www.tiktok.com/tag/viral"
+            ])
+            fallback_keywords = ["viral tiktok", "trending edits", "foryoupage clips", "popular viral video"]
             
-            if not all_sources:
-                all_sources = ["https://www.tiktok.com/tag/trending"]
+            # Sabhi strategies ko aik list mein sequence wise ya mix kar ke rakhna
+            strategies = []
+            
+            # 1. Pehli priority: Profiles aur Tags ko mix kar ke shuffle karein
+            primary_sources = profiles + tags
+            random.shuffle(primary_sources)
+            for src in primary_sources:
+                strategies.append((src, False))
                 
-            random.shuffle(all_sources)
-            
-            for source_url in all_sources:
+            # 2. Doosri priority / Fallback: Agar upar kuch na mile ya aur mazeed chahiye ho toh Search keywords
+            random.shuffle(fallback_keywords)
+            for kw in fallback_keywords:
+                strategies.append((kw, True))
+
+            total_added = 0
+            for target, is_search in strategies:
                 try:
-                    print(f"Scanning TikTok source: {source_url}")
-                    videos = _get_videos_from_url(source_url)
+                    print(f"Scanning via Strategy [Search={is_search}]: {target}")
+                    videos = _get_videos_from_source(target, is_search=is_search)
                     random.shuffle(videos)
                     
                     added = 0
@@ -146,16 +146,18 @@ def start_discovery_worker(instance):
                             "task_id": task_id,
                         })
                         added += 1
+                        total_added += 1
 
                     if added > 0:
-                        print(f"Added {added} unique videos from {source_url}")
+                        print(f"Successfully added {added} videos from {target}")
                         instance.start_worker()
                         
                 except Exception as e:
-                    print(f"Worker error on {source_url}: {e}")
+                    print(f"Strategy error on {target}: {e}, switching to next...")
                 
-                time.sleep(30)
+                time.sleep(20) # Har strategy ke darmiyan chota gap taake load na paray
             
+            print(f"Cycle completed. Total new videos queued: {total_added}. Sleeping for {CHECK_INTERVAL/3600} hours...")
             time.sleep(CHECK_INTERVAL)
 
     t = threading.Thread(target=worker_loop, daemon=True)
@@ -220,3 +222,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
