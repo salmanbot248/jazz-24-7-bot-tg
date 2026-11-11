@@ -1,8 +1,9 @@
 """
-TikTok Ultimate Command-Controlled & Cookie-Safe Pipeline.
-- Strictly TikTok only (Zero YouTube).
-- Session cookie preservation & 5-minute Keep-Alive ping.
-- Starts processing for zerofeed only after receiving: /start upload tiktok
+TikTok Ultimate Command-Controlled & Universal Cookie-Saver Pipeline.
+- Automatically detects and saves ALL session/cookie/state files (.pkl, .json, .session).
+- Pushes session files to Git instantly so you NEVER lose login state on updates.
+- 5-minute Keep-Alive ping to prevent cookie expiration.
+- Trigger command: upload tiktok (or /tiktok)
 """
 
 import json
@@ -12,6 +13,7 @@ import random
 import subprocess
 import threading
 import time
+import glob
 import urllib.request
 
 import bot as app
@@ -19,7 +21,6 @@ import bot as app
 SEEN_FILE = "tiktok_seen.json"
 TAGS_FILE = "tiktok_tags.json"
 PROFILES_FILE = "tiktok_profiles.json"
-SESSION_STATE_FILE = "session_state.pkl"
 CHECK_INTERVAL = 3600
 PING_INTERVAL = 300  # Har 5 minute baad session alive rakhne ke liye ping
 
@@ -129,9 +130,8 @@ def _get_videos_from_source(url):
 
 def start_discovery_worker(instance):
     def worker_loop():
-        print("💤 [Safe-Bot] Waiting for command: /start upload tiktok")
+        print("💤 [Safe-Bot] Waiting for command: upload tiktok")
         while True:
-            # Jab tak aap command nahi denge, ye yahin wait karega
             _discovery_active.wait()
             
             profiles = _load_json_file(PROFILES_FILE, [])
@@ -193,10 +193,10 @@ def _install_command_and_tracking():
         original_handle_message = app.BotInstance.handle_message
         def handle_message_with_command(self, message, *args, **kwargs):
             text = str(message.get("text", "")).strip().lower()
-            if "start upload tiktok" in text:
+            if "upload tiktok" in text or text == "/tiktok":
                 _discovery_active.set()
                 try:
-                    self.send_message(self.chat_id, "🚀 TikTok Auto-Discovery Activated! Fetching for zerofeed...")
+                    self.send_message(self.chat_id, "🚀 TikTok Auto-Discovery Activated! Fetching videos for zerofeed...")
                 except Exception:
                     pass
                 print("🚀 [Safe-Bot] Activated via Telegram command!")
@@ -224,9 +224,15 @@ def _install_command_and_tracking():
                 _save_seen_ids()
 
     def git_push_feed_and_seen():
+        # Universal backup: Workspace ki saari session, pickle, json aur state files ko auto-save karega
         subprocess.run(["git", "add", SEEN_FILE], check=False)
-        if os.path.exists(SESSION_STATE_FILE):
-            subprocess.run(["git", "add", SESSION_STATE_FILE], check=False)
+        
+        session_patterns = ["*.pkl", "*.session", "*.json", "*.txt"]
+        for pattern in session_patterns:
+            for file_path in glob.glob(pattern):
+                if file_path != "run_bot.py" and file_path != "README.md":
+                    subprocess.run(["git", "add", file_path], check=False)
+
         original_git_push_feed()
 
     app.BotInstance.process_social = process_social_with_tracking
@@ -243,7 +249,7 @@ def _install_auto_runner():
 def main():
     _install_command_and_tracking()
     _install_auto_runner()
-    start_keep_alive_ping()  # 5 min wala keep-alive active
+    start_keep_alive_ping()
 
     if not all(config["token"] for config in app.BOTS):
         raise SystemExit("BOT_TOKEN missing!")
