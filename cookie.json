@@ -1,0 +1,39 @@
+{
+  "cookies": [
+    {
+      "name": "JSESSIONID",
+      "value": "EB1CA17BA15E5099E4DCCC4EC79698D5.1i204",
+      "domain": "cloud.jazzdrive.com.pk",
+      "path": "/",
+      "expires": 1794550459.840581,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "validationKey",
+      "value": "6b4c2875543336295b253351435f7f34",
+      "domain": "cloud.jazzdrive.com.pk",
+      "path": "/",
+      "expires": 1829024059.841752,
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://cloud.jazzdrive.com.pk",
+      "localStorage": [
+        {
+          "name": "omhls",
+          "value": "{\"analyticsEnabled\":true}"
+        },
+        {
+          "name": "omhls.fingerprintKey",
+          "value": "a35ba86416d903d535efb416d1009445"
+        }
+      ]
+    }
+  ]
+}
