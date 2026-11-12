@@ -6,12 +6,18 @@ on:
   #   - cron: '0 */6 * * *'
 
 permissions:
-  contents: write
+  contents: write   # session/cookie files repo mein push karne ke liye
+  actions: write    # 5h40m baad workflow ko dobara chalane ke liye
+
+# Do bot ek saath na chalein (Telegram polling conflict) — naya run purane ke khatam hone ka intezar karega
+concurrency:
+  group: jazzdrive-bot
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
 
     steps:
       - name: Checkout repo
@@ -49,18 +55,34 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Run Bot
+      - name: Run Bot (5 ghante 40 minute tak)
         env:
           PYTHONUNBUFFERED: "1"
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          python run_bot.py
+          code=0
+          # 340 min = 5h40m. Is ke baad bot band hota hai (60 sec baad force kill) aur neeche naya run shuru hota hai
+          timeout -k 60 340m python run_bot.py || code=$?
+          echo "Bot exit code: $code"
+          # 0 = run_bot.py ne 335 min par khud saaf band kiya, 124 = timeout ne band kiya. Dono mein naya run chahiye
+          if [ "$code" -eq 0 ] || [ "$code" -eq 124 ]; then
+            echo "RESTART=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Commit updated session/token files back to repo
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add state1.json yt_token.json allowed_users.json feed.json instagram_cookies.txt tiktok_seen.json 2>/dev/null || true
+          git add -f state1.json cookie.json yt_token.json allowed_users.json feed.json instagram_cookies.txt tiktok_cookies.txt tiktok_seen.json tiktok_profiles.json tiktok_failed.json 2>/dev/null || true
           git diff --staged --quiet || git commit -m "Auto-update session/token files [skip ci]"
+          git pull --rebase --autostash || true
           git push || echo "Nothing to push or push failed"
+
+      - name: Auto restart (naya run shuru karo)
+        if: env.RESTART == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "$GITHUB_WORKFLOW" --ref "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          
