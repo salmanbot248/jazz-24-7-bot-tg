@@ -15,7 +15,7 @@
       "value": "257b3b615758492c545d7d232d47274e",
       "domain": "cloud.jazzdrive.com.pk",
       "path": "/",
-      "expires": 1796452122,
+      "expires": 1796536294,
       "httpOnly": false,
       "secure": true,
       "sameSite": "Lax"
@@ -27,7 +27,7 @@
       "localStorage": [
         {
           "name": "omhls",
-          "value": "{\"analyticsEnabled\":true}"
+          "value": "{\"analyticsEnabled\":true,\"currentHighlightActionTimestamp\":1795240295407,\"currentHighlightAction\":0}"
         },
         {
           "name": "omhls.fingerprintKey",
