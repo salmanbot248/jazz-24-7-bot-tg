@@ -2,20 +2,20 @@
   "cookies": [
     {
       "name": "JSESSIONID",
-      "value": "7B39EF0D2938D4A3EBAE272321836A80.1i204",
+      "value": "9DADF78A3B1053D098B811048DF5F1CC.1i204",
       "domain": "cloud.jazzdrive.com.pk",
       "path": "/",
-      "expires": 1795242520.536345,
+      "expires": 1795397535.496578,
       "httpOnly": true,
       "secure": true,
       "sameSite": "Lax"
     },
     {
       "name": "validationKey",
-      "value": "257b3b615758492c545d7d232d47274e",
+      "value": "2e2252434e244a2c265f302a46263754",
       "domain": "cloud.jazzdrive.com.pk",
       "path": "/",
-      "expires": 1796536294,
+      "expires": 1829871135.498013,
       "httpOnly": false,
       "secure": true,
       "sameSite": "Lax"
@@ -27,7 +27,7 @@
       "localStorage": [
         {
           "name": "omhls",
-          "value": "{\"analyticsEnabled\":true,\"currentHighlightActionTimestamp\":1795240295407,\"currentHighlightAction\":0}"
+          "value": "{\"analyticsEnabled\":true}"
         },
         {
           "name": "omhls.fingerprintKey",
